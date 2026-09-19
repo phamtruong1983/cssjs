@@ -15,6 +15,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
 from src.indicators.atr import atr as compute_atr  # noqa: E402
 from src.risk.risk_reward import compute_risk_reward  # noqa: E402
+from src.market_structure.zones import TICK  # noqa: E402
 
 FIXTURES_DIR = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "fixtures")
 
@@ -38,11 +39,13 @@ def test_fixture_01_buy_tradable():
     df = load_fixture_h1("01_buy_valid")
     atr = compute_atr(df, period=14)
     atr_h1_14 = float(atr.iloc[21])  # atr[sweep_idx - 1], sweep_idx=22
+    sweep_extreme = float(df.loc[22, "low"])  # sourced from the CSV, not hardcoded
 
     result = compute_risk_reward(
-        df, sweep_idx=22, direction="buy", zone_center=2000.0, sweep_extreme=1965.0, atr_h1_14=atr_h1_14
+        df, sweep_idx=22, direction="buy", zone_center=2000.0, sweep_extreme=sweep_extreme, atr_h1_14=atr_h1_14
     )
 
+    assert sweep_extreme == pytest.approx(1965.0)
     assert atr_h1_14 == pytest.approx(10.0)
     assert result.entry == pytest.approx(2000.0)
     assert result.stop == pytest.approx(1963.0)  # 1965 - 0.20*10
@@ -57,6 +60,39 @@ def test_fixture_01_buy_tradable():
     assert result.reason == "ok"
 
 
+def test_fixture_01_reward_and_rr_to_tp1():
+    """reward_to_tp1 / rr_to_tp1 are reference-only fields, per R1(c):
+    reward_to_tp1 = |tp1 - entry| = |2070 - 2000| = 70; rr_to_tp1 =
+    70 / 37 (using the same tick-rounded risk as rr_to_tp2)."""
+    df = load_fixture_h1("01_buy_valid")
+    atr = compute_atr(df, period=14)
+    atr_h1_14 = float(atr.iloc[21])
+    sweep_extreme = float(df.loc[22, "low"])
+
+    result = compute_risk_reward(
+        df, sweep_idx=22, direction="buy", zone_center=2000.0, sweep_extreme=sweep_extreme, atr_h1_14=atr_h1_14
+    )
+
+    assert result.reward_to_tp1 == pytest.approx(70.0)
+    assert result.rr_to_tp1 == pytest.approx(70 / 37)
+    # reference-only: does not affect tradable/reason, which are gated on rr_to_tp2 alone.
+    assert result.tradable is True
+    assert result.reason == "ok"
+
+
+def test_tp2_is_a_tick_multiple():
+    df = load_fixture_h1("01_buy_valid")
+    atr = compute_atr(df, period=14)
+    atr_h1_14 = float(atr.iloc[21])
+    sweep_extreme = float(df.loc[22, "low"])
+
+    result = compute_risk_reward(
+        df, sweep_idx=22, direction="buy", zone_center=2000.0, sweep_extreme=sweep_extreme, atr_h1_14=atr_h1_14
+    )
+    ticks = result.tp2 / TICK
+    assert ticks == pytest.approx(round(ticks), abs=1e-6)
+
+
 # ---------------------------------------------------------------------------
 # Fixture 02 (SELL) -- mirror of fixture 01
 # ---------------------------------------------------------------------------
@@ -66,11 +102,13 @@ def test_fixture_02_sell_tradable():
     df = load_fixture_h1("02_sell_valid")
     atr = compute_atr(df, period=14)
     atr_h1_14 = float(atr.iloc[21])
+    sweep_extreme = float(df.loc[22, "high"])  # sourced from the CSV, not hardcoded
 
     result = compute_risk_reward(
-        df, sweep_idx=22, direction="sell", zone_center=2000.0, sweep_extreme=2035.0, atr_h1_14=atr_h1_14
+        df, sweep_idx=22, direction="sell", zone_center=2000.0, sweep_extreme=sweep_extreme, atr_h1_14=atr_h1_14
     )
 
+    assert sweep_extreme == pytest.approx(2035.0)
     assert atr_h1_14 == pytest.approx(10.0)
     assert result.entry == pytest.approx(2000.0)
     assert result.stop == pytest.approx(2037.0)  # 2035 + 0.20*10
@@ -94,11 +132,13 @@ def test_fixture_05_rr_below_threshold():
     df = load_fixture_h1("05_rr_below_threshold")
     atr = compute_atr(df, period=14)
     atr_h1_14 = float(atr.iloc[21])
+    sweep_extreme = float(df.loc[22, "low"])  # sourced from the CSV, not hardcoded
 
     result = compute_risk_reward(
-        df, sweep_idx=22, direction="buy", zone_center=2000.0, sweep_extreme=1920.0, atr_h1_14=atr_h1_14
+        df, sweep_idx=22, direction="buy", zone_center=2000.0, sweep_extreme=sweep_extreme, atr_h1_14=atr_h1_14
     )
 
+    assert sweep_extreme == pytest.approx(1920.0)
     assert atr_h1_14 == pytest.approx(10.0)
     assert result.stop == pytest.approx(1918.0)  # 1920 - 0.20*10
     assert result.risk == pytest.approx(82.0)
@@ -238,6 +278,79 @@ def test_multiple_qualifying_swings_picks_largest_idx():
     result = compute_risk_reward(df, sweep_idx=14, direction="buy", zone_center=50.0, sweep_extreme=10.0, atr_h1_14=1.0)
     assert result.tp1_idx == 9
     assert result.tp1 == pytest.approx(200.0)
+
+
+def test_nearest_in_time_not_highest_price():
+    """Distinguishes 'nearest in time' from 'highest price': an EARLIER
+    swing high (idx3=200, higher price) and a LATER swing high (idx9=80,
+    lower price but still > entry=50) both qualify -- TP1 must be the
+    later one (idx9=80), proving selection is by recency, not magnitude."""
+    highs = [10, 20, 30, 200, 30, 20, 10, 20, 30, 80, 30, 20, 10, 20, 30]
+    lows = [h - 5 for h in highs]
+    df = make_df(highs, lows)
+    result = compute_risk_reward(df, sweep_idx=14, direction="buy", zone_center=50.0, sweep_extreme=10.0, atr_h1_14=1.0)
+    assert result.tp1_idx == 9
+    assert result.tp1 == pytest.approx(80.0)
+    assert result.tp1 != pytest.approx(200.0)
+
+
+def test_more_recent_swing_on_wrong_side_is_skipped_valid_one_still_chosen():
+    """A later swing high (idx9=40) is on the WRONG side of entry(50)
+    (40 <= 50, not a valid BUY reversal target) -- it must be skipped
+    even though it is more recent than the earlier, valid swing high
+    (idx3=100, which is > 50)."""
+    highs = [10, 20, 30, 100, 30, 20, 10, 20, 30, 40, 30, 20, 10, 20, 30]
+    lows = [h - 5 for h in highs]
+    df = make_df(highs, lows)
+    result = compute_risk_reward(df, sweep_idx=14, direction="buy", zone_center=50.0, sweep_extreme=10.0, atr_h1_14=1.0)
+    assert result.tp1_idx == 3
+    assert result.tp1 == pytest.approx(100.0)
+
+
+# ---------------------------------------------------------------------------
+# SELL mirror: R:R boundary and largest-idx selection
+# ---------------------------------------------------------------------------
+
+
+def test_sell_rr_exactly_2_0_is_tradable():
+    # Mirrors test_rr_exactly_2_0_is_tradable: swing low at idx3=0 (< entry=50).
+    # sweep_extreme=60 (>50, valid for sell). sweep_amplitude=|60-50|=10.
+    # tp2=tp1-amplitude=0-10=-10, reward=|-10-50|=60. stop=60+0.2*100=80,
+    # risk=|50-80|=30. rr=60/30=2.0 exactly.
+    lows = [90, 80, 70, 0, 70, 80, 90]
+    highs = [l + 5 for l in lows]
+    df = make_df(highs, lows)
+    result = compute_risk_reward(df, sweep_idx=6, direction="sell", zone_center=50.0, sweep_extreme=60.0, atr_h1_14=100.0)
+    assert result.tp1 == pytest.approx(0.0)
+    assert result.stop == pytest.approx(80.0)
+    assert result.risk == pytest.approx(30.0)
+    assert result.reward_to_tp2 == pytest.approx(60.0)
+    assert result.rr_to_tp2 == pytest.approx(2.0)
+    assert result.tradable is True
+    assert result.reason == "ok"
+
+
+def test_sell_rr_one_tick_under_2_0_is_not_tradable():
+    # tp1 raised by 1 tick (0.01) -> reward shrinks by 1 tick (59.99).
+    lows = [90, 80, 70, 0.01, 70, 80, 90]
+    highs = [l + 5 for l in lows]
+    df = make_df(highs, lows)
+    result = compute_risk_reward(df, sweep_idx=6, direction="sell", zone_center=50.0, sweep_extreme=60.0, atr_h1_14=100.0)
+    assert result.tp1 == pytest.approx(0.01)
+    assert result.reward_to_tp2 == pytest.approx(59.99)
+    assert result.risk == pytest.approx(30.0)
+    assert result.tradable is False
+    assert result.reason == "rr_below_threshold"
+
+
+def test_sell_multiple_qualifying_swings_picks_largest_idx():
+    # Two swing lows below entry(50): idx3=10 and idx9=-100.
+    lows = [90, 80, 70, 10, 70, 80, 90, 80, 70, -100, 70, 80, 90, 80, 70]
+    highs = [l + 50 for l in lows]
+    df = make_df(highs, lows)
+    result = compute_risk_reward(df, sweep_idx=14, direction="sell", zone_center=50.0, sweep_extreme=60.0, atr_h1_14=1.0)
+    assert result.tp1_idx == 9
+    assert result.tp1 == pytest.approx(-100.0)
 
 
 # ---------------------------------------------------------------------------

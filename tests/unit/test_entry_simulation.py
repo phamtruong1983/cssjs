@@ -346,3 +346,107 @@ def test_no_lookahead_expired_no_touch_data_after_window_does_not_affect_result(
     assert result_before.reason == "no_touch"
     assert result_before.outcome == result_after.outcome
     assert result_before.reason == result_after.reason
+
+
+# ---------------------------------------------------------------------------
+# fill_ts: populated when df has a `timestamp` column, None when it doesn't
+# ---------------------------------------------------------------------------
+
+
+def test_fill_ts_populated_when_timestamp_column_present():
+    df = pd.DataFrame(
+        {
+            "timestamp": ["2024-01-01T00:00:00Z", "2024-01-01T01:00:00Z", "2024-01-01T02:00:00Z"],
+            "high": [1, 2010, 2010],
+            "low": [1, 1995, 2005],
+        }
+    )
+    result = simulate_entry(df, activation_idx=0, direction="buy", entry=2000.0, stop=1963.0)
+    assert result.outcome == "filled"
+    assert result.fill_idx == 1
+    assert result.fill_ts == "2024-01-01T01:00:00Z"
+
+
+def test_fill_ts_none_when_no_timestamp_column():
+    df = make_df([(1, 1), (2010, 1995), (2010, 2005)])
+    result = simulate_entry(df, activation_idx=0, direction="buy", entry=2000.0, stop=1963.0)
+    assert result.outcome == "filled"
+    assert result.fill_ts is None
+
+
+# ---------------------------------------------------------------------------
+# SELL mirror: same-bar conflict, no_touch, stop touched on 2nd candle
+# ---------------------------------------------------------------------------
+
+
+def test_sell_same_bar_entry_stop_conflict():
+    # entry=2000, stop=2037 (sell). candle high>=stop and low<=entry -> conflict
+    df = make_df([(1, 1), (2040, 1995), (2010, 2005)])
+    result = simulate_entry(df, activation_idx=0, direction="sell", entry=2000.0, stop=2037.0)
+    assert result.outcome == "expired"
+    assert result.reason == "same_bar_entry_stop_conflict"
+    assert result.fill_idx is None
+    assert len(result.candles) == 1
+    c = result.candles[0]
+    assert c.entry_touched is True
+    assert c.stop_touched is True
+
+
+def test_sell_no_touch_both_candles():
+    df = make_df([(1, 1), (2010, 2005), (2015, 2008)])  # neither candle touches entry(2000) or stop(2037)
+    result = simulate_entry(df, activation_idx=0, direction="sell", entry=2000.0, stop=2037.0)
+    assert result.outcome == "expired"
+    assert result.reason == "no_touch"
+    assert len(result.candles) == 2
+    assert result.candles[0].entry_touched is False
+    assert result.candles[0].stop_touched is False
+    assert result.candles[1].entry_touched is False
+    assert result.candles[1].stop_touched is False
+
+
+def test_sell_stop_touched_on_second_candle_after_first_no_touch():
+    df = make_df([(1, 1), (2010, 2005), (2040, 2038)])  # candle1 no touch, candle2 stop touch only (low>entry)
+    result = simulate_entry(df, activation_idx=0, direction="sell", entry=2000.0, stop=2037.0)
+    assert result.outcome == "expired"
+    assert result.reason == "stop_touched_before_entry"
+    assert len(result.candles) == 2
+    assert result.candles[0].entry_touched is False
+    assert result.candles[0].stop_touched is False
+    assert result.candles[1].stop_touched is True
+    assert result.candles[1].entry_touched is False
+
+
+# ---------------------------------------------------------------------------
+# Same-bar conflict occurring on the 2nd window candle (1st candle touches nothing)
+# ---------------------------------------------------------------------------
+
+
+def test_same_bar_conflict_on_second_candle_after_first_no_touch():
+    # candle1 (buy): high<entry, low>stop -> no touch at all
+    # candle2: touches both entry and stop -> conflict
+    df = make_df([(1, 1), (1980, 1970), (2010, 1960)])
+    result = simulate_entry(df, activation_idx=0, direction="buy", entry=2000.0, stop=1963.0)
+    assert result.outcome == "expired"
+    assert result.reason == "same_bar_entry_stop_conflict"
+    assert len(result.candles) == 2
+    assert result.candles[0].entry_touched is False
+    assert result.candles[0].stop_touched is False
+    assert result.candles[1].entry_touched is True
+    assert result.candles[1].stop_touched is True
+
+
+# ---------------------------------------------------------------------------
+# Stop and entry on the exact same tick -> raise (invalid setup, not a data case)
+# ---------------------------------------------------------------------------
+
+
+def test_buy_stop_equal_entry_tick_raises():
+    df = make_df([(1, 1), (2010, 2005), (2010, 2005)])
+    with pytest.raises(ValueError, match="stop .* must be < entry"):
+        simulate_entry(df, activation_idx=0, direction="buy", entry=2000.0, stop=2000.0)
+
+
+def test_sell_stop_equal_entry_tick_raises():
+    df = make_df([(1, 1), (2010, 2005), (2010, 2005)])
+    with pytest.raises(ValueError, match="stop .* must be > entry"):
+        simulate_entry(df, activation_idx=0, direction="sell", entry=2000.0, stop=2000.0)

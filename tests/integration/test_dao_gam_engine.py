@@ -357,16 +357,18 @@ def test_run_engine_include_no_signal_returns_more_rows():
 # ---------------------------------------------------------------------------
 
 
-def test_no_lookahead_h1_after_sweep_plus_2_and_m15_after_2h_do_not_affect_result():
+def test_no_lookahead_h1_after_sweep_plus_3_and_m15_after_2h_do_not_affect_result():
     h1 = load_h1("01_buy_valid")
     m15 = load_m15("01_buy_valid")
     atr = compute_atr(h1, period=14)
 
     result_before = evaluate_sweep_candidate(h1, m15, atr, sweep_idx=22)
 
-    # fixture 01's h1.csv ends exactly at idx 24 (sweep_idx+2), so there
-    # is nothing to mutate past it on H1; extend with 2 more rows to
-    # prove they truly aren't read.
+    # fixture 01's h1.csv ends exactly at idx 24 (this fixture only has 1
+    # window candle, so it never reaches idx 25 = sweep_idx+3 anyway); the
+    # general no-look-ahead boundary the engine promises is sweep_idx+3
+    # (see module docstring), so we extend with 2 more rows to prove
+    # rows past the actual data end truly aren't read.
     h1_mutated = h1.copy()
     h1_mutated[["open", "high", "low", "close"]] = h1_mutated[["open", "high", "low", "close"]].astype(float)
     extra_h1 = pd.DataFrame(
@@ -423,6 +425,185 @@ def test_no_lookahead_h1_after_sweep_plus_2_and_m15_after_2h_do_not_affect_resul
     assert result_before.stop == result_after.stop
     assert result_before.tp1 == result_after.tp1
     assert result_before.tp2 == result_after.tp2
+
+
+def test_fixture_04_exact_boundary_sweep_plus_3_is_actually_read():
+    """Companion to the no-look-ahead test above: mutating H1 row idx 25
+    (= sweep_idx+3, the LAST row of the entry-validity window) so it
+    touches entry must flip the result from EXPIRED/no_touch to
+    NEEDS_MANUAL_REVIEW/filled -- proving idx 25 really is read, not just
+    that rows beyond it are ignored."""
+    h1 = load_h1("04_expired_no_entry_touch")
+    m15 = load_m15("04_expired_no_entry_touch")
+
+    atr_before = compute_atr(h1, period=14)
+    result_before = evaluate_sweep_candidate(h1, m15, atr_before, sweep_idx=22)
+    assert result_before.status == "EXPIRED"
+    assert result_before.stage == "expired"
+
+    h1_mutated = h1.copy()
+    h1_mutated[["open", "high", "low", "close"]] = h1_mutated[["open", "high", "low", "close"]].astype(float)
+    h1_mutated.loc[25, "low"] = 2000.0  # idx 25 = sweep_idx+3 now touches entry(2000.0)
+    atr_mutated = compute_atr(h1_mutated, period=14)
+    result_after = evaluate_sweep_candidate(h1_mutated, m15, atr_mutated, sweep_idx=22)
+
+    assert result_after.status == "NEEDS_MANUAL_REVIEW"
+    assert result_after.stage == "filled"
+    assert result_after.fill_idx == 25
+
+
+# ---------------------------------------------------------------------------
+# range_prefilter: True vs False must give identical status/stage
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "name",
+    [
+        "01_buy_valid",
+        "02_sell_valid",
+        "03_no_m15_reaction",
+        "04_expired_no_entry_touch",
+        "05_rr_below_threshold",
+        "06_same_bar_entry_sl_conflict",
+        "07_real_breakout_no_close_back",
+    ],
+)
+def test_range_prefilter_true_vs_false_identical_for_fixtures(name):
+    h1 = load_h1(name)
+    m15 = load_m15(name)
+    atr = compute_atr(h1, period=14)
+    for sweep_idx in range(len(h1)):
+        if sweep_idx < 1 or pd.isna(atr.iloc[sweep_idx - 1]):
+            continue
+        r_on = evaluate_sweep_candidate(h1, m15, atr, sweep_idx, range_prefilter=True)
+        r_off = evaluate_sweep_candidate(h1, m15, atr, sweep_idx, range_prefilter=False)
+        if r_on.status is None and r_off.status is None:
+            continue
+        assert r_on.status == r_off.status, sweep_idx
+        assert r_on.stage == r_off.stage, sweep_idx
+
+
+def test_range_prefilter_true_vs_false_identical_for_synthetic_run_engine():
+    h1 = load_h1("01_buy_valid")
+    m15 = load_m15("01_buy_valid")
+    results_on = run_engine(h1, m15, include_no_signal=True, range_prefilter=True)
+    results_off = run_engine(h1, m15, include_no_signal=True, range_prefilter=False)
+    assert len(results_on) == len(results_off)
+    for r_on, r_off in zip(results_on, results_off):
+        assert r_on.status == r_off.status
+        assert r_on.stage == r_off.stage
+
+
+# ---------------------------------------------------------------------------
+# activation_bar_missing: sweep-side numeric fields must still be populated
+# ---------------------------------------------------------------------------
+
+
+def test_activation_bar_missing_still_populates_sweep_numeric_fields():
+    h1 = load_h1("01_buy_valid").iloc[:23].reset_index(drop=True)  # ends exactly at sweep_idx=22
+    m15 = load_m15("01_buy_valid")
+    atr = compute_atr(h1, period=14)
+    r = evaluate_sweep_candidate(h1, m15, atr, sweep_idx=22)
+    assert r.stage == "activation_bar_missing"
+    assert r.status is None
+    assert r.atr_h1_14 is not None
+    assert r.h1_range is not None
+    assert r.range_multiple is not None
+    assert r.pierce_depth is not None
+    assert r.sweep_extreme is not None
+
+
+def test_activation_bar_missing_wrong_gap_still_populates_sweep_numeric_fields():
+    h1 = load_h1("01_buy_valid")
+    m15 = load_m15("01_buy_valid")
+    h1_dropped = h1.drop(index=23).reset_index(drop=True)
+    atr = compute_atr(h1_dropped, period=14)
+    r = evaluate_sweep_candidate(h1_dropped, m15, atr, sweep_idx=22)
+    assert r.stage == "activation_bar_missing"
+    assert r.status is None
+    assert r.atr_h1_14 is not None
+    assert r.h1_range is not None
+    assert r.range_multiple is not None
+    assert r.pierce_depth is not None
+    assert r.sweep_extreme is not None
+
+
+# ---------------------------------------------------------------------------
+# Zone selection: touch_count tie (distance decides), then anchor_idx tie
+# ---------------------------------------------------------------------------
+
+
+def _build_two_support_zones_h1(sweep_close: float) -> pd.DataFrame:
+    """Two same-touch_count (2) support zones: A anchored idx3/9 at
+    99.58 (band [99.08,100.08]), B anchored idx15/21 at 100.42 (band
+    [99.92,100.92]); their bands overlap on [99.92,100.08], so a sweep
+    candle closing in that overlap can trap both simultaneously."""
+    lows = [
+        150, 140, 130, 99.58, 130, 140, 150, 140, 130, 99.58, 130, 140, 150, 140, 130,
+        100.42, 130, 140, 150, 140, 130, 100.42, 130, 140, 150, 140, 130, 130, 140, 150,
+    ]
+    highs = [l + 50 for l in lows]
+    closes = [(h + l) / 2 for h, l in zip(highs, lows)]
+    h1 = pd.DataFrame(
+        {
+            "timestamp": pd.date_range("2024-02-01T00:00:00Z", periods=len(highs), freq="h").astype(str),
+            "open": closes,
+            "high": highs,
+            "low": lows,
+            "close": closes,
+        }
+    )
+    sweep_row = pd.DataFrame(
+        [
+            {
+                "timestamp": (pd.Timestamp("2024-02-01T00:00:00Z") + pd.Timedelta(hours=len(highs))).isoformat(),
+                "open": 130.0,
+                "high": 132.0,
+                "low": 50.0,
+                "close": sweep_close,
+            }
+        ]
+    )
+    return pd.concat([h1, sweep_row], ignore_index=True)
+
+
+def test_zone_selection_touch_count_tie_prefers_closer_zone():
+    # sweep close 99.93 is closer to zone A's center (99.58, dist 0.35)
+    # than zone B's (100.42, dist 0.49); both have touch_count=2.
+    h1 = _build_two_support_zones_h1(99.93)
+    atr = compute_atr(h1, period=14)
+    sweep_idx = len(h1) - 1
+    empty_m15 = pd.DataFrame(columns=["timestamp", "open", "high", "low", "close"])
+    r = evaluate_sweep_candidate(h1, empty_m15, atr, sweep_idx)
+
+    trapped = {
+        round(c["zone"]["zone_center"], 4): c["zone"]["touch_count"]
+        for c in r.zone_candidates
+        if c["sweep_result"].is_trap and c["zone"]["side"] == "support"
+    }
+    assert trapped == {99.58: 2, 100.42: 2}
+    assert r.zone_center == pytest.approx(99.58)
+
+
+def test_zone_selection_touch_count_and_distance_tie_prefers_larger_anchor_idx():
+    # sweep close 100.0 is exactly equidistant (0.42) from both zone
+    # centers (99.58 and 100.42), both touch_count=2 -> the tie-break
+    # falls to the larger anchor_idx: zone B (anchor_idx=15) beats zone A
+    # (anchor_idx=3).
+    h1 = _build_two_support_zones_h1(100.0)
+    atr = compute_atr(h1, period=14)
+    sweep_idx = len(h1) - 1
+    empty_m15 = pd.DataFrame(columns=["timestamp", "open", "high", "low", "close"])
+    r = evaluate_sweep_candidate(h1, empty_m15, atr, sweep_idx)
+
+    trapped = {
+        round(c["zone"]["zone_center"], 4): c["zone"]["touch_count"]
+        for c in r.zone_candidates
+        if c["sweep_result"].is_trap and c["zone"]["side"] == "support"
+    }
+    assert trapped == {99.58: 2, 100.42: 2}
+    assert r.zone_center == pytest.approx(100.42)
 
 
 def test_truncated_data_at_lookahead_boundary_matches_full_data():

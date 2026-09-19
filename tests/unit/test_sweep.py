@@ -388,6 +388,24 @@ def test_zone_bad_bounds_raises():
 # ---------------------------------------------------------------------------
 
 
+def test_atr_zero_at_idx_minus_1_gives_atr_unavailable_no_zero_division():
+    df = make_base_df(2220, 2225, 2210, 2220.0)
+    atr = compute_atr(df, period=14).copy()
+    atr.iloc[21] = 0.0
+    result = detect_sweep(df, atr, idx=22, zone=SUPPORT_ZONE)
+    assert result.is_trap is False
+    assert result.reason == "atr_unavailable"
+    assert pd.isna(result.atr_h1_14)
+
+
+def test_atr_series_too_short_raises_value_error():
+    df = make_base_df(2220, 2225, 2210, 2220.0)
+    atr_full = compute_atr(df, period=14)
+    atr_short = atr_full.iloc[:21]  # last valid position is 20; idx-1=21 does not exist
+    with pytest.raises(ValueError, match="atr series too short"):
+        detect_sweep(df, atr_short, idx=22, zone=SUPPORT_ZONE)
+
+
 def test_no_lookahead_data_after_idx_does_not_affect_result():
     df = make_base_df(2220, 2225, 2210, 2220.0)
     df = pd.concat(

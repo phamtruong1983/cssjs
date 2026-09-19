@@ -56,14 +56,15 @@ ZONE SELECTION (when more than one merged zone traps on the same
 `anchor_idx`.
 
 CHỐNG LOOK-AHEAD / no-look-ahead: the pipeline for `sweep_idx` only
-depends on `h1_df` rows up to `sweep_idx + 2` (the entry-validity window,
-positions `sweep_idx+1` and `sweep_idx+2`) and M15 rows in the hour
-`[sweep_ts+1h, sweep_ts+2h)` (the activation bar's hour). `atr` must
-already be computed by the caller (this engine does not slice or
-recompute it). Zones themselves are computed with `as_of=sweep_idx-1`
-(`create_zones` never reads past that). No H1 row at or after
-`sweep_idx + 3`, and no M15 row at or after `sweep_ts + 2h`, is ever
-read.
+depends on `h1_df` rows up to `sweep_idx + 3` (the entry-validity window
+is `sweep_idx+2` and `sweep_idx+3`; the activation candle `sweep_idx+1`
+itself is only checked for existence/timestamp, never read for
+high/low/close touch logic) and M15 rows in the hour `[sweep_ts+1h,
+sweep_ts+2h)` (the activation bar's hour). `atr` must already be
+computed by the caller (this engine does not slice or recompute it).
+Zones themselves are computed with `as_of=sweep_idx-1` (`create_zones`
+never reads past that). No H1 row at or after `sweep_idx + 4`, and no
+M15 row at or after `sweep_ts + 2h`, is ever read.
 
 ASSUMPTIONS / OPEN QUESTIONS (not specified in the docs, decided here):
   - `tp1_unavailable` (from `compute_risk_reward`) is deliberately NOT
@@ -165,6 +166,7 @@ class EngineResult:
     tp1: float | None
     tp2: float | None
     rr_to_tp2: float | None
+    rr_to_tp1: float | None
     fill_idx: int | None
 
     stop_breached_in_activation_hour: bool | None
@@ -201,6 +203,7 @@ def _empty_result(sweep_idx: int, stage: str, reason: str, sweep_ts=None) -> Eng
         tp1=None,
         tp2=None,
         rr_to_tp2=None,
+        rr_to_tp1=None,
         fill_idx=None,
         stop_breached_in_activation_hour=None,
         reason=reason,
@@ -242,6 +245,7 @@ def evaluate_sweep_candidate(
     zone_width: float = 1.00,
     min_touches: int = 2,
     n: int = 3,
+    range_prefilter: bool = True,
 ) -> EngineResult:
     """Run the full Dao Gam V1 pipeline for one candidate sweep candle.
 
@@ -260,6 +264,20 @@ def evaluate_sweep_candidate(
     sweep_idx : positional (0-based) index of the candidate sweep candle.
     zone_width, min_touches, n : forwarded to `create_zones` /
         `find_swings` (via `compute_risk_reward`).
+    range_prefilter : if `True` (default), a pure performance
+        optimization run BEFORE `create_zones` is ever called: if the
+        sweep candle's own `(high - low)` is less than
+        `1.5 * atr.iloc[sweep_idx-1] - 2*TICK`, the candle cannot possibly
+        satisfy `detect_sweep`'s own `range >= 1.5*atr` trap condition, so
+        the pipeline short-circuits to `stage="no_trap"`, `status=None`,
+        `reason` mentioning `"range_prefilter"`, without computing zones
+        at all. The `-2*TICK` safety margin is MANDATORY: `detect_sweep`
+        compares in tick-rounded integers (`>=`), so a candle whose raw
+        float range is a hair below `1.5*atr` can still tick-round to a
+        trap; subtracting `2*TICK` here guarantees this prefilter never
+        rejects a candle that `detect_sweep` itself would still consider
+        a trap. Set `False` to always call `create_zones` (e.g. for
+        testing prefilter equivalence).
 
     Returns
     -------
@@ -270,6 +288,18 @@ def evaluate_sweep_candidate(
         return _empty_result(sweep_idx, "atr_unavailable", "ATR not available for sweep_idx-1")
 
     sweep_ts = pd.to_datetime(h1_df["timestamp"].iloc[sweep_idx], utc=True)
+
+    if range_prefilter:
+        sweep_high = float(h1_df["high"].iloc[sweep_idx])
+        sweep_low = float(h1_df["low"].iloc[sweep_idx])
+        atr_at_idx_minus_1 = float(atr.iloc[sweep_idx - 1])
+        if (sweep_high - sweep_low) < 1.5 * atr_at_idx_minus_1 - 2 * TICK:
+            return _empty_result(
+                sweep_idx,
+                "no_trap",
+                "range_prefilter: sweep candle range below 1.5*atr-2*TICK, skipped create_zones",
+                sweep_ts=sweep_ts,
+            )
 
     zones_df = create_zones(h1_df, as_of=sweep_idx - 1, n=n, width=zone_width, min_touches=min_touches)
     if zones_df.empty:
@@ -324,6 +354,11 @@ def evaluate_sweep_candidate(
             winning_zone["touch_idxs"],
             winning_zone["merged_rows"],
         )
+        result.atr_h1_14 = sweep_result.atr_h1_14
+        result.h1_range = sweep_result.h1_range
+        result.range_multiple = sweep_result.range_multiple
+        result.pierce_depth = sweep_result.pierce_depth
+        result.sweep_extreme = sweep_result.sweep_extreme
         return result
 
     activation_ts = pd.to_datetime(h1_df["timestamp"].iloc[activation_idx], utc=True)
@@ -339,6 +374,11 @@ def evaluate_sweep_candidate(
             winning_zone["touch_idxs"],
             winning_zone["merged_rows"],
         )
+        result.atr_h1_14 = sweep_result.atr_h1_14
+        result.h1_range = sweep_result.h1_range
+        result.range_multiple = sweep_result.range_multiple
+        result.pierce_depth = sweep_result.pierce_depth
+        result.sweep_extreme = sweep_result.sweep_extreme
         return result
 
     base_reason = (
@@ -432,6 +472,7 @@ def evaluate_sweep_candidate(
         r.tp1 = rr_result.tp1
         r.tp2 = rr_result.tp2
         r.rr_to_tp2 = rr_result.rr_to_tp2
+        r.rr_to_tp1 = rr_result.rr_to_tp1
         r.stop_breached_in_activation_hour = stop_breached_in_activation_hour
         return r
 
@@ -461,6 +502,7 @@ def evaluate_sweep_candidate(
     r.tp1 = rr_result.tp1
     r.tp2 = rr_result.tp2
     r.rr_to_tp2 = rr_result.rr_to_tp2
+    r.rr_to_tp1 = rr_result.rr_to_tp1
     r.stop_breached_in_activation_hour = stop_breached_in_activation_hour
     return r
 
@@ -475,6 +517,7 @@ def run_engine(
     min_touches: int = 2,
     n: int = 3,
     atr_period: int = 14,
+    range_prefilter: bool = True,
 ) -> list[EngineResult]:
     """Scan `h1_df` for sweep candidates and evaluate each with
     `evaluate_sweep_candidate`. ATR is computed once (via
@@ -488,6 +531,9 @@ def run_engine(
         non-`None` `status` are returned. If `True`, every evaluated
         `EngineResult` is returned regardless of `status`.
     zone_width, min_touches, n, atr_period : forwarded to the pipeline.
+    range_prefilter : forwarded to `evaluate_sweep_candidate` (see its
+        docstring) -- a performance optimization only, does not change
+        results for any candidate that reaches a non-`None` status.
 
     Returns
     -------
@@ -502,7 +548,14 @@ def run_engine(
     results = []
     for sweep_idx in range(lo, hi + 1):
         result = evaluate_sweep_candidate(
-            h1_df, m15_df, atr, sweep_idx, zone_width=zone_width, min_touches=min_touches, n=n
+            h1_df,
+            m15_df,
+            atr,
+            sweep_idx,
+            zone_width=zone_width,
+            min_touches=min_touches,
+            n=n,
+            range_prefilter=range_prefilter,
         )
         if include_no_signal or result.status is not None:
             results.append(result)

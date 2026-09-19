@@ -20,11 +20,12 @@ closed H1 bar this function is allowed to know about. No row after
 FIELD NAMES: match `docs/DATA_SCHEMA.md` Sections 5-6 where a field of
 that name exists there (`direction`, `entry`, `stop`, `tp1`, `tp2`,
 `risk`, `sweep_amplitude`, `atr_h1_14`, `sweep_extreme`, `zone_center`).
-`tp1_idx`, `reward_to_tp2`, `rr_to_tp2`, `tradable`, and `reason` are not
-named in `docs/DATA_SCHEMA.md` (see ASSUMPTIONS). This module reports
-`reward_to_tp2`/`rr_to_tp2` (the schema's `rr2`/its reward component), not
-`rr1`/TP1's reward -- `docs/DAO_GAM_RULES.md` Section 3 rule 8 only gates
-on R:R to TP2.
+`tp1_idx`, `reward_to_tp1`, `rr_to_tp1`, `reward_to_tp2`, `rr_to_tp2`,
+`tradable`, and `reason` are not named in `docs/DATA_SCHEMA.md` (see
+ASSUMPTIONS). `docs/DAO_GAM_RULES.md` Section 3 rule 8 only gates on R:R
+to TP2 -- `reward_to_tp1`/`rr_to_tp1` (this module's approximation of the
+schema's `rr1`) are populated FOR REFERENCE ONLY and never affect
+`tradable`/`reason`.
 
 TP1 SELECTION (`DAO_GAM_RULES.md` Section 3 rule 8 / `docs/DATA_SCHEMA.md`
 Section 6: "nearest H1 swing high/low in the reversal direction"): the
@@ -45,6 +46,15 @@ tick-rounding is this module's own ASSUMPTION, consistent with
 R:R THRESHOLD: compared in integer ticks (`reward_t = tick(reward_to_tp2)`,
 `risk_t = tick(risk)`): `reward_t >= 2 * risk_t` passes (`>=`, so exactly
 2.0 passes), per `DAO_GAM_RULES.md` Section 3 rule 8 ("R:R to TP2 >= 2.0").
+`tp2`, `risk`, and `reward_to_tp2` (and, for reference, `reward_to_tp1`)
+are all rounded to the nearest tick (via this module's own `_round_tick`)
+before `rr_to_tp2`/`rr_to_tp1` are computed from those rounded values --
+this avoids binary floating-point noise propagating into the ratio.
+
+SWING SELECTION COMPARISON: whether a swing qualifies "on the reversal
+side, strictly beyond entry" is decided in integer ticks --
+`tick(high) > tick(entry)` for BUY, `tick(low) < tick(entry)` for SELL --
+not a raw float comparison, for the same floating-point-noise reason.
 
 ASSUMPTIONS (not specified in the docs, decided here):
   - TP1 "nearest" = nearest in time (largest confirmed swing index) --
@@ -97,6 +107,8 @@ class RiskRewardResult:
     tp2: float | None
     sweep_amplitude: float
     risk: float
+    reward_to_tp1: float | None
+    rr_to_tp1: float | None
     reward_to_tp2: float | None
     rr_to_tp2: float | None
     atr_h1_14: float
@@ -233,24 +245,29 @@ def compute_risk_reward(
         if stop_t <= entry_t:
             raise ValueError(f"computed stop ({stop}) is not above entry ({entry}) for direction='sell'")
 
-    risk = abs(entry - stop)
+    risk = _round_tick(abs(entry - stop))
     sweep_amplitude = abs(sweep_extreme - zone_center)
 
     # TP1: nearest-in-time confirmed swing on the reversal side (see
-    # module docstring TP1 SELECTION / ASSUMPTIONS).
+    # module docstring TP1 SELECTION / ASSUMPTIONS). Comparison against
+    # entry is done in integer ticks (SWING SELECTION COMPARISON above).
     swings = find_swings(used, n=n)
     tp1 = None
     tp1_idx = None
     if direction == "buy":
         candidates = [
-            i for i in range(len(used)) if bool(swings["is_swing_high"].iloc[i]) and used["high"].iloc[i] > entry
+            i
+            for i in range(len(used))
+            if bool(swings["is_swing_high"].iloc[i]) and _tick(float(used["high"].iloc[i])) > entry_t
         ]
         if candidates:
             tp1_idx = max(candidates)
             tp1 = float(used["high"].iloc[tp1_idx])
     else:
         candidates = [
-            i for i in range(len(used)) if bool(swings["is_swing_low"].iloc[i]) and used["low"].iloc[i] < entry
+            i
+            for i in range(len(used))
+            if bool(swings["is_swing_low"].iloc[i]) and _tick(float(used["low"].iloc[i])) < entry_t
         ]
         if candidates:
             tp1_idx = max(candidates)
@@ -268,6 +285,8 @@ def compute_risk_reward(
             tp2=None,
             sweep_amplitude=sweep_amplitude,
             risk=risk,
+            reward_to_tp1=None,
+            rr_to_tp1=None,
             reward_to_tp2=None,
             rr_to_tp2=None,
             atr_h1_14=atr_h1_14,
@@ -279,8 +298,12 @@ def compute_risk_reward(
         tp2 = tp1 + sweep_amplitude
     else:
         tp2 = tp1 - sweep_amplitude
+    tp2 = _round_tick(tp2)
 
-    reward_to_tp2 = abs(tp2 - entry)
+    reward_to_tp1 = _round_tick(abs(tp1 - entry))
+    rr_to_tp1 = reward_to_tp1 / risk
+
+    reward_to_tp2 = _round_tick(abs(tp2 - entry))
     rr_to_tp2 = reward_to_tp2 / risk
 
     risk_t = _tick(risk)
@@ -298,6 +321,8 @@ def compute_risk_reward(
         tp2=tp2,
         sweep_amplitude=sweep_amplitude,
         risk=risk,
+        reward_to_tp1=reward_to_tp1,
+        rr_to_tp1=rr_to_tp1,
         reward_to_tp2=reward_to_tp2,
         rr_to_tp2=rr_to_tp2,
         atr_h1_14=atr_h1_14,

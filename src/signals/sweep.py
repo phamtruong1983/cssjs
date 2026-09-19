@@ -14,9 +14,15 @@ sweep candle's own, typically huge, True Range). This matches
 `tests/fixtures/01_buy_valid/README.md`'s documented `atr_h1_14 = 10.00`
 for the sweep candle at idx 22, which is `atr.iloc[21]` under standard
 Wilder ATR (see `tests/unit/test_atr.py::test_atr_matches_fixture_01_documented_value`
-for the same reasoning applied to the ATR module itself). If `idx < 1` or
-`atr.iloc[idx - 1]` is NaN, this function does not raise -- it returns a
-not-a-trap result with `reason = "atr_unavailable"`.
+for the same reasoning applied to the ATR module itself). If `idx < 1`,
+`atr.iloc[idx - 1]` is NaN, or `atr.iloc[idx - 1] == 0`, this function
+does not raise -- it returns a not-a-trap result with
+`reason = "atr_unavailable"` (an ATR of exactly 0 would otherwise divide
+by zero when computing `range_multiple`, so it is treated the same as
+"not available" rather than raising). If `idx >= 1` and the `atr` Series
+is too short to have an entry at position `idx - 1`, this DOES raise
+`ValueError` (a caller bug -- a mismatched `atr` Series -- not a normal
+"not enough data yet" case).
 
 CHỐNG LOOK-AHEAD / no-look-ahead: only `df` row `idx` and `atr.iloc[idx - 1]`
 are ever read. No other row of `df` or `atr` is inspected, so changing
@@ -181,7 +187,14 @@ def detect_sweep(df: pd.DataFrame, atr: pd.Series, idx: int, zone: Mapping) -> S
 
     h1_range = _round_tick(high - low)
 
-    if idx < 1 or pd.isna(atr.iloc[idx - 1]):
+    if idx >= 1 and idx - 1 >= len(atr):
+        raise ValueError(
+            f"atr series too short: need atr.iloc[{idx - 1}] (idx-1), but atr has length {len(atr)}"
+        )
+
+    atr_at_idx_minus_1 = float("nan") if idx < 1 else atr.iloc[idx - 1]
+
+    if idx < 1 or pd.isna(atr_at_idx_minus_1) or atr_at_idx_minus_1 == 0:
         return SweepResult(
             is_trap=False,
             direction=direction,

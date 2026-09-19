@@ -482,6 +482,22 @@ def test_nan_in_window_candle_raises():
         check_m15_reaction(df, SWEEP_H1_OPEN, direction="buy", zone_center=2000.0)
 
 
+def test_inf_in_window_candle_raises_value_error_not_overflow():
+    df = load_m15("01_buy_valid").copy()
+    df[["open", "high", "low", "close"]] = df[["open", "high", "low", "close"]].astype(float)
+    df.loc[df["timestamp"] == "2024-01-02T23:00:00Z", "high"] = np.inf
+    with pytest.raises(ValueError, match="not finite"):
+        check_m15_reaction(df, SWEEP_H1_OPEN, direction="buy", zone_center=2000.0)
+
+
+def test_neg_inf_in_window_candle_raises_value_error():
+    df = load_m15("01_buy_valid").copy()
+    df[["open", "high", "low", "close"]] = df[["open", "high", "low", "close"]].astype(float)
+    df.loc[df["timestamp"] == "2024-01-02T23:00:00Z", "low"] = -np.inf
+    with pytest.raises(ValueError, match="not finite"):
+        check_m15_reaction(df, SWEEP_H1_OPEN, direction="buy", zone_center=2000.0)
+
+
 def test_high_below_low_in_window_candle_raises():
     df = load_m15("01_buy_valid").copy()
     mask = df["timestamp"] == "2024-01-02T23:00:00Z"

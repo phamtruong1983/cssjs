@@ -58,8 +58,11 @@ VALIDATION:
   - Timestamps of the rows that fall in the window must be **strictly
     increasing in the order they appear in `m15_df`** -- this module
     never sorts by timestamp. A duplicate or out-of-order timestamp among
-    window rows raises `ValueError`. NaN or invalid OHLC OUTSIDE the
-    window never raises (only window rows are read/validated).
+    window rows raises `ValueError`. NaN, non-finite (`inf`/`-inf`), or
+    invalid OHLC OUTSIDE the window never raises (only window rows are
+    read/validated) -- but a window row with `open`/`high`/`low`/`close`
+    equal to `inf`/`-inf` raises `ValueError` (not left to surface later
+    as an `OverflowError` from the tick-integer conversion).
 
 ASSUMPTIONS (not specified in the docs, decided here):
   - `activation_h1_open` = `sweep_h1_open + 1h` (i.e. `window_start`) when
@@ -147,6 +150,8 @@ def _validate_row(row: pd.Series) -> None:
     for col in ("open", "high", "low", "close"):
         if pd.isna(row[col]):
             raise ValueError(f"column '{col}' is NaN at timestamp {row['timestamp']}")
+        if not np.isfinite(row[col]):
+            raise ValueError(f"column '{col}' is not finite (inf) at timestamp {row['timestamp']}")
     if row["high"] < row["low"]:
         raise ValueError(f"invalid OHLC: high < low at timestamp {row['timestamp']}")
 
