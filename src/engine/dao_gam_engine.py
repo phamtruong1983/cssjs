@@ -109,11 +109,76 @@ candle with `tick(low) <= tick(stop)`; SELL: any candle with
 point (stopped earlier). This is purely informational -- it never
 changes `status`, `stage`, or which branch the pipeline takes; a setup
 can still end as `NEEDS_MANUAL_REVIEW` with this flag `True` (V1 does not
-act on it).
+act on it). `run_engine` always includes this field (module 8b D4 --
+no code change was needed: it is a plain `EngineResult` field and
+`run_engine` returns `EngineResult` objects unchanged).
+
+MODULE 8b -- ATR-RELATIVE ZONE WIDTH (`zone_width_atr`, `D1`): an
+OPTIONAL parameter on `evaluate_sweep_candidate`/`run_engine`, appended
+AFTER every existing parameter, default `None`. `None` (the default)
+reproduces the exact prior behavior: `zone_width` (the absolute-price
+parameter, default `1.00`) is passed to `create_zones` unchanged, and
+`EngineResult.zone_width_mode` is `"absolute"`. When `zone_width_atr` is
+not `None`, it OVERRIDES `zone_width` entirely (the absolute parameter is
+ignored, and this is deliberate, not a bug): the effective width is
+`zone_width_atr * atr.iloc[sweep_idx-1]` (the same already-closed ATR
+`detect_sweep` itself gates on), rounded to the nearest whole tick via
+`round(x / TICK)` (`TICK` from `src.market_structure.zones`), with a
+floor of 1 tick, and `EngineResult.zone_width_mode` is `"atr"`. Either
+way, the width actually used is recorded in `EngineResult.
+zone_width_used`; both `zone_width_used`/`zone_width_mode` are `None`
+only when the pipeline never reaches the zone-creation step at all
+(`stage="atr_unavailable"` or a `range_prefilter` short-circuit) --
+every stage from `create_zones` onward (including `"no_trap"`) has them
+populated. `zone_width_atr` must be a finite real number `> 0` (not
+`bool`); invalid values raise `TypeError` (wrong type, including `bool`)
+or `ValueError` (non-finite or `<= 0`), checked unconditionally at the
+top of `evaluate_sweep_candidate`, before any other stage runs.
+`range_prefilter`'s own `1.5*atr` threshold check is unaffected by
+`zone_width_atr` -- it is about the sweep candle's range, not the zone
+band.
+
+MODULE 8b -- `annotate_repeats` (`D2`): a public function,
+`annotate_repeats(results: list[EngineResult]) -> list[EngineResult]`,
+returning a NEW list of shallow-copied `EngineResult`s (never mutates its
+input) with two extra flags set: `repeat_zone_within_24h` and
+`repeat_zone_within_72h`. For a result with a non-`None` `status`, each
+flag is `True` if some OTHER result earlier in the same input list (by
+`sweep_ts`, strictly smaller -- never a later one) also has a non-`None`
+`status`, the same `direction`, the same `zone_center` (compared as
+integer ticks, `round(x/TICK)`), and its `sweep_ts` is at most 24h (resp.
+72h) before this result's `sweep_ts`; otherwise `False`. A result whose
+own `status` is `None` gets `None` for both flags. `run_engine` calls
+`annotate_repeats` on the FULL per-call result list (every `sweep_idx` in
+`[start_idx, end_idx]`) BEFORE applying `include_no_signal` filtering, so
+the flags reflect exactly that one call's candidate set. These flags are
+scoped to a SINGLE list: if a caller scans in chunks (multiple
+`run_engine`/`evaluate_sweep_candidate` calls, e.g. for a long history),
+each chunk's `run_engine` call only sees repeats within its own chunk --
+to get flags that see across chunk boundaries, the caller must
+concatenate the raw per-chunk results themselves and call
+`annotate_repeats` once on the concatenated list (this module does not
+do that automatically; it has no memory across calls). These flags are
+REPORTING ONLY -- they never feed back into `status`/`stage`/routing.
+
+MODULE 8b -- window gap diagnostics (`D3`): `EngineResult` gains
+`window_max_gap_hours: float | None` and `window_spans_weekend: bool |
+None`, populated ONLY once `simulate_entry` has actually run (i.e. the
+pipeline reached step g -- reason `"ok"` from `compute_risk_reward`),
+`None` before that. The timestamp sequence considered is: the activation
+candle (`sweep_idx+1`, already read and validated in step d) followed by
+the timestamp of every candle `simulate_entry` logged in its own
+`result.candles` (each `WindowCandle.idx`) -- i.e. exactly the H1 rows
+this pipeline already reads for `sweep_idx`, nothing extra.
+`window_max_gap_hours` is the largest gap (in hours) between two
+consecutive timestamps in that sequence; `window_spans_weekend` is
+`window_max_gap_hours > 24`. If fewer than 2 timestamps are available
+(e.g. no window candle was read at all), both stay `None`.
 """
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+import math
+from dataclasses import dataclass, field, replace
 
 import pandas as pd
 
@@ -127,6 +192,18 @@ from src.execution.entry_simulation import simulate_entry
 
 def _tick(x: float) -> int:
     return round(x / TICK)
+
+
+def _validate_zone_width_atr(zone_width_atr) -> float:
+    if isinstance(zone_width_atr, bool) or not isinstance(zone_width_atr, (int, float)):
+        raise TypeError(f"zone_width_atr must be a number, got {type(zone_width_atr).__name__}")
+    value = float(zone_width_atr)
+    if not math.isfinite(value):
+        raise ValueError(f"zone_width_atr must be finite, got {zone_width_atr!r}")
+    if value <= 0:
+        raise ValueError(f"zone_width_atr must be > 0, got {zone_width_atr!r}")
+    return value
+
 
 STATUS_NEEDS_MANUAL_REVIEW = "NEEDS_MANUAL_REVIEW"
 STATUS_REJECTED_M15_NO_REACTION = "REJECTED_M15_NO_REACTION"
@@ -173,6 +250,14 @@ class EngineResult:
 
     reason: str
     zone_candidates: list = field(default_factory=list)
+
+    # module 8b
+    zone_width_used: float | None = None
+    zone_width_mode: str | None = None  # "absolute" | "atr" | None
+    repeat_zone_within_24h: bool | None = None
+    repeat_zone_within_72h: bool | None = None
+    window_max_gap_hours: float | None = None
+    window_spans_weekend: bool | None = None
 
 
 def _empty_result(sweep_idx: int, stage: str, reason: str, sweep_ts=None) -> EngineResult:
@@ -246,6 +331,7 @@ def evaluate_sweep_candidate(
     min_touches: int = 2,
     n: int = 3,
     range_prefilter: bool = True,
+    zone_width_atr: float | None = None,
 ) -> EngineResult:
     """Run the full Dao Gam V1 pipeline for one candidate sweep candle.
 
@@ -278,12 +364,23 @@ def evaluate_sweep_candidate(
         rejects a candle that `detect_sweep` itself would still consider
         a trap. Set `False` to always call `create_zones` (e.g. for
         testing prefilter equivalence).
+    zone_width_atr : optional (module 8b, `D1`). `None` (default): no
+        change from prior behavior, `zone_width` is used as-is and
+        `EngineResult.zone_width_mode` is `"absolute"`. Otherwise
+        OVERRIDES `zone_width`: the effective width is
+        `zone_width_atr * atr.iloc[sweep_idx-1]`, rounded to the nearest
+        tick (floor 1 tick), and `zone_width_mode` is `"atr"`. See module
+        docstring MODULE 8b section for full details and validation
+        rules.
 
     Returns
     -------
     EngineResult. `status` is `None` unless the pipeline reached a stage
     that assigns a pipeline status.
     """
+    if zone_width_atr is not None:
+        _validate_zone_width_atr(zone_width_atr)
+
     if sweep_idx < 1 or sweep_idx >= len(h1_df) or pd.isna(atr.iloc[sweep_idx - 1]):
         return _empty_result(sweep_idx, "atr_unavailable", "ATR not available for sweep_idx-1")
 
@@ -301,9 +398,22 @@ def evaluate_sweep_candidate(
                 sweep_ts=sweep_ts,
             )
 
-    zones_df = create_zones(h1_df, as_of=sweep_idx - 1, n=n, width=zone_width, min_touches=min_touches)
+    if zone_width_atr is None:
+        effective_width = zone_width
+        zone_width_mode = "absolute"
+    else:
+        atr_prev = float(atr.iloc[sweep_idx - 1])
+        raw_width = _validate_zone_width_atr(zone_width_atr) * atr_prev
+        ticks = max(round(raw_width / TICK), 1)
+        effective_width = round(ticks * TICK, 10)
+        zone_width_mode = "atr"
+
+    zones_df = create_zones(h1_df, as_of=sweep_idx - 1, n=n, width=effective_width, min_touches=min_touches)
     if zones_df.empty:
-        return _empty_result(sweep_idx, "no_trap", "No confirmed zone as of sweep_idx-1", sweep_ts=sweep_ts)
+        result = _empty_result(sweep_idx, "no_trap", "No confirmed zone as of sweep_idx-1", sweep_ts=sweep_ts)
+        result.zone_width_used = effective_width
+        result.zone_width_mode = zone_width_mode
+        return result
 
     merged_zones = _merge_zones(zones_df)
 
@@ -326,6 +436,8 @@ def evaluate_sweep_candidate(
             sweep_idx, "no_trap", "No candidate zone produced a confirmed trap at sweep_idx", sweep_ts=sweep_ts
         )
         result.zone_candidates = zone_candidates
+        result.zone_width_used = effective_width
+        result.zone_width_mode = zone_width_mode
         return result
 
     sweep_close = float(h1_df["close"].iloc[sweep_idx])
@@ -359,6 +471,8 @@ def evaluate_sweep_candidate(
         result.range_multiple = sweep_result.range_multiple
         result.pierce_depth = sweep_result.pierce_depth
         result.sweep_extreme = sweep_result.sweep_extreme
+        result.zone_width_used = effective_width
+        result.zone_width_mode = zone_width_mode
         return result
 
     activation_ts = pd.to_datetime(h1_df["timestamp"].iloc[activation_idx], utc=True)
@@ -379,6 +493,8 @@ def evaluate_sweep_candidate(
         result.range_multiple = sweep_result.range_multiple
         result.pierce_depth = sweep_result.pierce_depth
         result.sweep_extreme = sweep_result.sweep_extreme
+        result.zone_width_used = effective_width
+        result.zone_width_mode = zone_width_mode
         return result
 
     base_reason = (
@@ -403,6 +519,8 @@ def evaluate_sweep_candidate(
         r.sweep_extreme = sweep_result.sweep_extreme
         r.sweep_amplitude = None
         r.zone_candidates = zone_candidates
+        r.zone_width_used = effective_width
+        r.zone_width_mode = zone_width_mode
         return r
 
     # Step e: M15 reaction.
@@ -481,6 +599,23 @@ def evaluate_sweep_candidate(
         h1_df, activation_idx=sweep_idx + 1, direction=direction, entry=rr_result.entry, stop=rr_result.stop
     )
 
+    # D3 (module 8b): max gap between consecutive timestamps in exactly
+    # the H1 rows this pipeline read for the entry window -- the
+    # activation candle plus every candle simulate_entry logged (its own
+    # `candles[i].idx`), nothing beyond that.
+    window_ts_seq = [activation_ts] + [
+        pd.to_datetime(h1_df["timestamp"].iloc[c.idx], utc=True) for c in entry_result.candles
+    ]
+    if len(window_ts_seq) >= 2:
+        window_gaps_hours = [
+            (b - a).total_seconds() / 3600.0 for a, b in zip(window_ts_seq, window_ts_seq[1:])
+        ]
+        window_max_gap_hours = max(window_gaps_hours)
+        window_spans_weekend = window_max_gap_hours > 24
+    else:
+        window_max_gap_hours = None
+        window_spans_weekend = None
+
     entry_reason = _rr_reason(f"rr_to_tp2={rr_result.rr_to_tp2} entry_outcome={entry_result.outcome}")
 
     if entry_result.outcome == "expired":
@@ -504,7 +639,57 @@ def evaluate_sweep_candidate(
     r.rr_to_tp2 = rr_result.rr_to_tp2
     r.rr_to_tp1 = rr_result.rr_to_tp1
     r.stop_breached_in_activation_hour = stop_breached_in_activation_hour
+    r.window_max_gap_hours = window_max_gap_hours
+    r.window_spans_weekend = window_spans_weekend
     return r
+
+
+def annotate_repeats(results: list[EngineResult]) -> list[EngineResult]:
+    """Set `repeat_zone_within_24h`/`repeat_zone_within_72h` (module 8b,
+    `D2`) on a COPY of `results` -- never mutates its argument.
+
+    For each result with a non-`None` `status`, each flag is `True` if
+    some OTHER result earlier in `results` (by `sweep_ts`, strictly
+    smaller) also has a non-`None` `status`, the same `direction`, the
+    same `zone_center` (compared as integer ticks), and its `sweep_ts` is
+    at most 24h (resp. 72h) before this result's `sweep_ts`. A result
+    whose own `status` is `None` gets `None` for both flags. The
+    comparison only ever looks backward in `sweep_ts` order -- a later
+    result never affects an earlier one's flags.
+
+    These flags are scoped to exactly the list passed in. See module
+    docstring MODULE 8b section for how to combine multiple chunked
+    scans. Purely a reporting aid -- never used to gate `status`/`stage`.
+    """
+    output = [replace(r) for r in results]
+
+    candidates = [
+        (i, r) for i, r in enumerate(results) if r.status is not None and r.sweep_ts is not None
+    ]
+    candidates.sort(key=lambda item: item[1].sweep_ts)
+
+    history: dict[tuple, list] = {}
+    for i, r in candidates:
+        zone_center_tick = _tick(r.zone_center) if r.zone_center is not None else None
+        key = (r.direction, zone_center_tick)
+        prior_ts_list = history.setdefault(key, [])
+
+        repeat_24h = False
+        repeat_72h = False
+        for prior_ts in prior_ts_list:
+            if prior_ts >= r.sweep_ts:
+                continue
+            delta_hours = (r.sweep_ts - prior_ts).total_seconds() / 3600.0
+            if delta_hours <= 24:
+                repeat_24h = True
+            if delta_hours <= 72:
+                repeat_72h = True
+
+        output[i].repeat_zone_within_24h = repeat_24h
+        output[i].repeat_zone_within_72h = repeat_72h
+        prior_ts_list.append(r.sweep_ts)
+
+    return output
 
 
 def run_engine(
@@ -518,6 +703,7 @@ def run_engine(
     n: int = 3,
     atr_period: int = 14,
     range_prefilter: bool = True,
+    zone_width_atr: float | None = None,
 ) -> list[EngineResult]:
     """Scan `h1_df` for sweep candidates and evaluate each with
     `evaluate_sweep_candidate`. ATR is computed once (via
@@ -534,18 +720,24 @@ def run_engine(
     range_prefilter : forwarded to `evaluate_sweep_candidate` (see its
         docstring) -- a performance optimization only, does not change
         results for any candidate that reaches a non-`None` status.
+    zone_width_atr : forwarded to `evaluate_sweep_candidate` (module 8b,
+        `D1`). `None` (default) reproduces prior behavior exactly.
 
     Returns
     -------
-    list[EngineResult]. No cooldown or overlap suppression is applied
-    (out of scope; see module docstring).
+    list[EngineResult]. `annotate_repeats` (module 8b, `D2`) is called on
+    the FULL per-call result list (every `sweep_idx` in `[start_idx,
+    end_idx]`) BEFORE `include_no_signal` filtering is applied, so the
+    repeat flags reflect exactly this one call's candidate set. No
+    cooldown or overlap suppression is applied (out of scope; see module
+    docstring).
     """
     atr = compute_atr(h1_df, period=atr_period)
 
     lo = 0 if start_idx is None else start_idx
     hi = len(h1_df) - 1 if end_idx is None else end_idx
 
-    results = []
+    all_results = []
     for sweep_idx in range(lo, hi + 1):
         result = evaluate_sweep_candidate(
             h1_df,
@@ -556,7 +748,12 @@ def run_engine(
             min_touches=min_touches,
             n=n,
             range_prefilter=range_prefilter,
+            zone_width_atr=zone_width_atr,
         )
-        if include_no_signal or result.status is not None:
-            results.append(result)
-    return results
+        all_results.append(result)
+
+    annotated = annotate_repeats(all_results)
+
+    if include_no_signal:
+        return annotated
+    return [r for r in annotated if r.status is not None]

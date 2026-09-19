@@ -5,6 +5,7 @@ src/engine/dao_gam_engine.py against the real fixtures (tests/fixtures/*)
 and a handful of synthetic in-memory variations. Does not modify any
 fixture file on disk.
 """
+import dataclasses
 import os
 import sys
 
@@ -15,7 +16,11 @@ import pytest
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))), "src"))
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
 from src.indicators.atr import atr as compute_atr  # noqa: E402
-from src.engine.dao_gam_engine import evaluate_sweep_candidate, run_engine  # noqa: E402
+from src.engine.dao_gam_engine import (  # noqa: E402
+    annotate_repeats,
+    evaluate_sweep_candidate,
+    run_engine,
+)
 
 FIXTURES_DIR = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "fixtures")
 
@@ -357,12 +362,13 @@ def test_run_engine_include_no_signal_returns_more_rows():
 # ---------------------------------------------------------------------------
 
 
-def test_no_lookahead_h1_after_sweep_plus_3_and_m15_after_2h_do_not_affect_result():
+@pytest.mark.parametrize("zone_width_atr", [None, 0.10])
+def test_no_lookahead_h1_after_sweep_plus_3_and_m15_after_2h_do_not_affect_result(zone_width_atr):
     h1 = load_h1("01_buy_valid")
     m15 = load_m15("01_buy_valid")
     atr = compute_atr(h1, period=14)
 
-    result_before = evaluate_sweep_candidate(h1, m15, atr, sweep_idx=22)
+    result_before = evaluate_sweep_candidate(h1, m15, atr, sweep_idx=22, zone_width_atr=zone_width_atr)
 
     # fixture 01's h1.csv ends exactly at idx 24 (this fixture only has 1
     # window candle, so it never reaches idx 25 = sweep_idx+3 anyway); the
@@ -415,7 +421,9 @@ def test_no_lookahead_h1_after_sweep_plus_3_and_m15_after_2h_do_not_affect_resul
     )
     m15_mutated = pd.concat([m15_mutated, extra_m15], ignore_index=True)
 
-    result_after = evaluate_sweep_candidate(h1_mutated, m15_mutated, atr_mutated, sweep_idx=22)
+    result_after = evaluate_sweep_candidate(
+        h1_mutated, m15_mutated, atr_mutated, sweep_idx=22, zone_width_atr=zone_width_atr
+    )
 
     assert result_before.status == result_after.status
     assert result_before.stage == result_after.stage
@@ -623,3 +631,248 @@ def test_truncated_data_at_lookahead_boundary_matches_full_data():
     assert result_full.entry == result_truncated.entry
     assert result_full.stop == result_truncated.stop
     assert result_full.fill_idx == result_truncated.fill_idx
+
+
+# ---------------------------------------------------------------------------
+# Module 8b -- D1: zone_width_atr
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "name",
+    [
+        "01_buy_valid",
+        "02_sell_valid",
+        "03_no_m15_reaction",
+        "04_expired_no_entry_touch",
+        "05_rr_below_threshold",
+        "06_same_bar_entry_sl_conflict",
+        "07_real_breakout_no_close_back",
+    ],
+)
+def test_zone_width_atr_matches_default_when_atr_is_10(name):
+    # Every fixture's base history has atr_h1_14 == 10.00 exactly at
+    # sweep_idx=22, so zone_width_atr=0.10 -> effective width
+    # 0.10*10.00 == 1.00, identical to the default absolute width.
+    r_default = evaluate(name)
+    r_atr = evaluate(name, zone_width_atr=0.10)
+
+    assert r_atr.status == r_default.status
+    assert r_atr.stage == r_default.stage
+    assert r_atr.zone_low == r_default.zone_low
+    assert r_atr.zone_high == r_default.zone_high
+    assert r_atr.entry == r_default.entry
+    assert r_atr.stop == r_default.stop
+    assert r_atr.tp1 == r_default.tp1
+    assert r_atr.tp2 == r_default.tp2
+    assert r_atr.entry_state == r_default.entry_state
+    assert r_atr.fill_idx == r_default.fill_idx
+
+    assert r_atr.zone_width_used == pytest.approx(1.0)
+    assert r_atr.zone_width_mode == "atr"
+    assert r_default.zone_width_mode == "absolute"
+
+
+def _scale_h1_m15(h1, m15, k):
+    h1_scaled = h1.copy()
+    h1_scaled[["open", "high", "low", "close"]] = h1_scaled[["open", "high", "low", "close"]].astype(float) * k
+    m15_scaled = m15.copy()
+    if not m15_scaled.empty:
+        m15_scaled[["open", "high", "low", "close"]] = (
+            m15_scaled[["open", "high", "low", "close"]].astype(float) * k
+        )
+    return h1_scaled, m15_scaled
+
+
+@pytest.mark.parametrize("k", [2, 3])
+def test_zone_width_atr_scale_invariant(k):
+    h1 = load_h1("01_buy_valid")
+    m15 = load_m15("01_buy_valid")
+    r_base = evaluate_sweep_candidate(h1, m15, compute_atr(h1, period=14), sweep_idx=22, zone_width_atr=0.10)
+
+    h1_scaled, m15_scaled = _scale_h1_m15(h1, m15, k)
+    atr_scaled = compute_atr(h1_scaled, period=14)
+    r_scaled = evaluate_sweep_candidate(h1_scaled, m15_scaled, atr_scaled, sweep_idx=22, zone_width_atr=0.10)
+
+    assert r_scaled.status == r_base.status
+    assert r_scaled.stage == r_base.stage
+    assert r_scaled.entry_state == r_base.entry_state
+    assert r_scaled.touch_idxs == r_base.touch_idxs
+
+    assert r_scaled.zone_width_used == pytest.approx(r_base.zone_width_used * k)
+    assert r_scaled.entry == pytest.approx(r_base.entry * k)
+    assert r_scaled.stop == pytest.approx(r_base.stop * k, rel=1e-3)
+    assert r_scaled.tp1 == pytest.approx(r_base.tp1 * k)
+    assert r_scaled.tp2 == pytest.approx(r_base.tp2 * k, rel=1e-3)
+
+
+@pytest.mark.parametrize("bad_value", [0, -1.0, float("nan"), float("inf"), True, "0.10"])
+def test_zone_width_atr_invalid_raises(bad_value):
+    with pytest.raises((TypeError, ValueError)):
+        evaluate("01_buy_valid", zone_width_atr=bad_value)
+
+
+@pytest.mark.parametrize(
+    "name,expected_count",
+    [
+        ("01_buy_valid", 1),
+        ("02_sell_valid", 1),
+        ("03_no_m15_reaction", 1),
+        ("04_expired_no_entry_touch", 1),
+        ("05_rr_below_threshold", 1),
+        ("06_same_bar_entry_sl_conflict", 1),
+        ("07_real_breakout_no_close_back", 0),
+    ],
+)
+def test_run_engine_zone_width_atr_matches_default_result_counts(name, expected_count):
+    h1 = load_h1(name)
+    m15 = load_m15(name)
+    results = run_engine(h1, m15, zone_width_atr=0.10)
+    assert len(results) == expected_count
+
+
+# ---------------------------------------------------------------------------
+# Module 8b -- D2: annotate_repeats
+# ---------------------------------------------------------------------------
+
+
+def _make_result(sweep_ts, direction, zone_center, status="NEEDS_MANUAL_REVIEW"):
+    base = evaluate("01_buy_valid")  # a real, fully-populated EngineResult to clone
+    return dataclasses.replace(
+        base,
+        sweep_ts=pd.Timestamp(sweep_ts, tz="UTC"),
+        direction=direction,
+        zone_center=zone_center,
+        status=status,
+    )
+
+
+def test_annotate_repeats_exact_24h_boundary_is_true():
+    r1 = _make_result("2024-01-01T00:00:00Z", "buy", 2000.0)
+    r2 = _make_result("2024-01-02T00:00:00Z", "buy", 2000.0)  # exactly 24h later
+    out = annotate_repeats([r1, r2])
+    assert out[0].repeat_zone_within_24h is False
+    assert out[1].repeat_zone_within_24h is True
+    assert out[1].repeat_zone_within_72h is True
+
+
+def test_annotate_repeats_24h_plus_1min_is_false_for_24h_true_for_72h():
+    r1 = _make_result("2024-01-01T00:00:00Z", "buy", 2000.0)
+    r2 = _make_result("2024-01-02T00:01:00Z", "buy", 2000.0)  # 24h1m later
+    out = annotate_repeats([r1, r2])
+    assert out[1].repeat_zone_within_24h is False
+    assert out[1].repeat_zone_within_72h is True
+
+
+def test_annotate_repeats_different_direction_is_false():
+    r1 = _make_result("2024-01-01T00:00:00Z", "buy", 2000.0)
+    r2 = _make_result("2024-01-01T12:00:00Z", "sell", 2000.0)
+    out = annotate_repeats([r1, r2])
+    assert out[1].repeat_zone_within_24h is False
+    assert out[1].repeat_zone_within_72h is False
+
+
+def test_annotate_repeats_different_zone_center_by_one_tick_is_false():
+    r1 = _make_result("2024-01-01T00:00:00Z", "buy", 2000.00)
+    r2 = _make_result("2024-01-01T12:00:00Z", "buy", 2000.01)
+    out = annotate_repeats([r1, r2])
+    assert out[1].repeat_zone_within_24h is False
+    assert out[1].repeat_zone_within_72h is False
+
+
+def test_annotate_repeats_first_result_is_false():
+    r1 = _make_result("2024-01-01T00:00:00Z", "buy", 2000.0)
+    out = annotate_repeats([r1])
+    assert out[0].repeat_zone_within_24h is False
+    assert out[0].repeat_zone_within_72h is False
+
+
+def test_annotate_repeats_status_none_gives_none_flags():
+    r1 = _make_result("2024-01-01T00:00:00Z", "buy", 2000.0, status=None)
+    out = annotate_repeats([r1])
+    assert out[0].repeat_zone_within_24h is None
+    assert out[0].repeat_zone_within_72h is None
+
+
+def test_annotate_repeats_later_result_does_not_affect_earlier_result_flags():
+    r1 = _make_result("2024-01-01T00:00:00Z", "buy", 2000.0)
+    r2 = _make_result("2024-01-01T12:00:00Z", "buy", 2000.0)
+    out = annotate_repeats([r1, r2])
+    assert out[0].repeat_zone_within_24h is False
+    assert out[0].repeat_zone_within_72h is False
+
+
+def test_annotate_repeats_unordered_input_gives_correct_flags_and_preserves_order():
+    r_early = _make_result("2024-01-01T00:00:00Z", "buy", 2000.0)
+    r_late = _make_result("2024-01-01T12:00:00Z", "buy", 2000.0)
+    # pass the LATE one first -- input order is deliberately not sorted
+    out = annotate_repeats([r_late, r_early])
+    # output preserves input order: out[0] is r_late, out[1] is r_early
+    assert out[0].sweep_ts == r_late.sweep_ts
+    assert out[1].sweep_ts == r_early.sweep_ts
+    assert out[0].repeat_zone_within_24h is True  # r_late comes after r_early chronologically
+    assert out[1].repeat_zone_within_24h is False  # r_early has nothing before it
+
+    # original list must not be mutated
+    assert r_late.repeat_zone_within_24h is None
+    assert r_early.repeat_zone_within_24h is None
+
+
+# ---------------------------------------------------------------------------
+# Module 8b -- D3: window_max_gap_hours / window_spans_weekend
+# ---------------------------------------------------------------------------
+
+
+def test_window_gap_fixture_01_one_hour_no_weekend():
+    r = evaluate("01_buy_valid")
+    assert r.window_max_gap_hours == pytest.approx(1.0)
+    assert r.window_spans_weekend is False
+
+
+def test_window_gap_fixture_04_one_hour_no_weekend():
+    r = evaluate("04_expired_no_entry_touch")
+    assert r.window_max_gap_hours == pytest.approx(1.0)
+    assert r.window_spans_weekend is False
+    assert r.status == "EXPIRED"
+
+
+def test_window_gap_fixture_04_shifted_48h_spans_weekend():
+    h1 = load_h1("04_expired_no_entry_touch")
+    m15 = load_m15("04_expired_no_entry_touch")
+    h1_shifted = h1.copy()
+    ts = pd.to_datetime(h1_shifted["timestamp"], utc=True)
+    ts.iloc[24:] = ts.iloc[24:] + pd.Timedelta(hours=48)
+    h1_shifted["timestamp"] = ts.dt.strftime("%Y-%m-%dT%H:%M:%SZ")
+    atr = compute_atr(h1_shifted, period=14)
+
+    r = evaluate_sweep_candidate(h1_shifted, m15, atr, sweep_idx=22)
+    assert r.window_max_gap_hours == pytest.approx(49.0)
+    assert r.window_spans_weekend is True
+    assert r.status == "EXPIRED"
+
+
+def test_window_gap_fixture_04_shifted_1h_no_weekend():
+    h1 = load_h1("04_expired_no_entry_touch")
+    m15 = load_m15("04_expired_no_entry_touch")
+    h1_shifted = h1.copy()
+    ts = pd.to_datetime(h1_shifted["timestamp"], utc=True)
+    ts.iloc[24:] = ts.iloc[24:] + pd.Timedelta(hours=1)
+    h1_shifted["timestamp"] = ts.dt.strftime("%Y-%m-%dT%H:%M:%SZ")
+    atr = compute_atr(h1_shifted, period=14)
+
+    r = evaluate_sweep_candidate(h1_shifted, m15, atr, sweep_idx=22)
+    assert r.window_max_gap_hours == pytest.approx(2.0)
+    assert r.window_spans_weekend is False
+
+
+# ---------------------------------------------------------------------------
+# Module 8b -- D4: stop_breached_in_activation_hour still present
+# ---------------------------------------------------------------------------
+
+
+def test_d4_stop_breach_field_present_via_run_engine():
+    h1 = load_h1("01_buy_valid")
+    m15 = load_m15("01_buy_valid")
+    results = run_engine(h1, m15)
+    assert len(results) == 1
+    assert results[0].stop_breached_in_activation_hour is False
