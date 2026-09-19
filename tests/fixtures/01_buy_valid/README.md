@@ -16,8 +16,11 @@ exercises the full happy path through `NEEDS_MANUAL_REVIEW`.
   - `h1_range = 81` (>= 1.5 * ATR = 15 ✓)
   - `pierce_depth = zone_low(1999.5) - low(1965) = 34.5` (>= 0.25 * ATR = 2.5 ✓)
   - `close = 2000.0` is inside `[zone_low, zone_high] = [1999.5, 2000.5]` → trap confirmed.
-- idx 23: the hour where the M15 reaction fires and price also touches the
-  entry price.
+- idx 23: the **activation bar** — the hour where the M15 reaction fires.
+  Per `DAO_GAM_RULES.md` Section 5 (`[V1_DECISION]`), this bar does **not**
+  count toward the entry validity window.
+- idx 24: the **first of the 2 validity-window H1 candles**, where price
+  touches the entry price.
 
 ## Derived values
 
@@ -47,8 +50,8 @@ the sweep" are unambiguously the 4 candles of the next hour (`23:00`–
 
 | Candle | close | body/range | close_position | passes? |
 |---|---|---|---|---|
-| 23:00 | 2001 | 1/4 = 0.25 | 0.75 | fails (body ratio < 0.30) |
-| 23:15 | 2004 | 3/5 = 0.60 | (2004-2000)/5 = 0.80 | **fires** (a,b,c all pass) |
+| 23:00 | 2004 | 1/5 = 0.20 | (2004-2003)/5=0.20 | fails (body ratio < 0.30) |
+| 23:15 | 2010 | 6/9 = 0.667 | (2010-2003)/9=0.778 | **fires** (a,b,c all pass) |
 | 23:30 | (not reached) | | | |
 | 23:45 | (not reached) | | | |
 
@@ -61,11 +64,17 @@ Reaction fires on the 2nd M15 candle → within the 4-candle limit.
 
 ## Entry touch
 
-idx 23 H1 range is `[1998, 2015]`, which spans `entry = 2000.00` → the
-order (a limit order at `zone_center`, per rules doc Section 5) is touched
-within the validity window. This fixture stops here — it asserts entry is
-touched, not a full SL/TP resolution (that is backtest-engine scope, not
-yet built).
+Per `DAO_GAM_RULES.md` Section 5 (`[V1_DECISION]`, resolved), the
+activation bar (idx 23, where the M15 reaction fires) does **not** count
+toward the 2-H1-candle validity window — the window starts at the **next**
+H1 candle. idx 23's own range `[2003, 2018]` deliberately stays above
+`entry = 2000.00`, so it does not pre-fill the order.
+
+idx 24 (`2024-01-03T00:00:00Z`) is the **first candle of the validity
+window**: range `[1998, 2020]` spans `entry = 2000.00` → the order (a
+limit order at `zone_center`) is touched. This fixture stops here — it
+asserts entry is touched within the correct window, not a full SL/TP
+resolution (that is backtest-engine scope, not yet built).
 
 ## Expected engine outcome (once implemented)
 

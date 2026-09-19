@@ -1,4 +1,4 @@
-# Fixture 05 — R:R to TP2 below 2.0 → RR_BELOW_THRESHOLD
+# Fixture 05 — R:R to TP2 below 2.0 → REJECTED_RR_BELOW_THRESHOLD
 
 Same base history and zone as Fixture 01 (`tp1 = 2070.00`, `atr_h1_14 =
 10.00`), but the sweep goes much deeper, which lowers `rr2` below the
@@ -32,15 +32,18 @@ Note: the sweep hour's last M15 candle (`22:45`) is `open=1960, high=2000,
 low=1920, close=2000` (same OHLC correction as Fixture 01; caught by
 `tests/unit/test_data_schema.py`).
 
-Reuses Fixture 01's idx-23 M15 candles exactly; the reaction fires on the
-2nd candle (`23:15`). Included so this fixture demonstrates the RR gate
-applies **regardless of whether the R:R check happens before or after the
-M15 check** — `DAO_GAM_RULES.md` does not specify that ordering, so this
-fixture does not depend on it.
+Reuses Fixture 01's idx-23 (activation bar) M15 candles exactly; the
+reaction fires on the 2nd candle (`23:15`). Included so this fixture
+demonstrates the RR gate applies **regardless of whether the R:R check
+happens before or after the M15 check** — `DAO_GAM_RULES.md` does not
+specify that ordering, so this fixture does not depend on it. Since the
+R:R gate is evaluated from H1-only values (`entry`/`stop`/`tp1`/`tp2`), it
+does not depend on the entry-validity-window rule either — no window
+candles (post-activation) are included in this fixture.
 
 ## Expected engine outcome
 
-No tradable signal. Logged with `status = "RR_BELOW_THRESHOLD"` (per
-`DAO_GAM_RULES.md` Section 6, exact string `RR_BELOW_THRESHOLD` — not
-`REJECTED_RR_BELOW_THRESHOLD`; flagging this naming detail since the task
-brief that requested this fixture used the latter spelling).
+No tradable signal. Logged with `status = "REJECTED_RR_BELOW_THRESHOLD"`,
+per `DAO_GAM_RULES.md` Section 6 (this is the user-confirmed final status
+name for V1; an earlier draft of the rules doc used `RR_BELOW_THRESHOLD`
+without the `REJECTED_` prefix — now corrected everywhere).

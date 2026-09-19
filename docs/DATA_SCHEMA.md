@@ -108,7 +108,7 @@ carries one `status` value:
 | `NEEDS_MANUAL_REVIEW` | A fully confirmed, tradable V1 signal. Never a recommendation or certain trade. | `DAO_GAM_RULES.md` Section 6. |
 | `REJECTED_M15_NO_REACTION` | H1 trap confirmed, but no M15 candle in the 4-candle window satisfied the reversal-reaction conditions. | Section 4 / Section 6. |
 | `EXPIRED` | H1 + M15 confirmed, limit order posted at `zone_center`, but price never traded there within the 2-H1-candle validity window. Not counted as a trade. | Section 5 / Section 6. |
-| `RR_BELOW_THRESHOLD` | Setup fully confirmed but R:R to TP2 `< 2.0`. | Section 3 rule 8 / Section 6. |
+| `REJECTED_RR_BELOW_THRESHOLD` | Setup fully confirmed but R:R to TP2 `< 2.0`. | Section 3 rule 8 / Section 6. |
 
 **Not a named status:** a candle that pierces the zone with sufficient
 range/depth but does **not** close back inside the zone is, per the rules
@@ -125,12 +125,13 @@ Every record also carries the fields listed in `DAO_GAM_RULES.md` Section
 TP1/TP2, D1/H4 structure snapshot, tick-volume snapshot if available,
 intra-hour bucket for both the H1 confirmation and the M15 reaction).
 
-## 9. Open question carried over from fixture construction
+## 9. Entry validity window counting (resolved)
 
-`DAO_GAM_RULES.md` Section 5 says the entry/SL validity window is "2
-subsequent H1 candles ... from the bar the order becomes active," without
-saying whether that count includes the activating bar itself or starts
-strictly after it. This does not block the fixtures in this repo (see
-`tests/fixtures/06_same_bar_entry_sl_conflict/README.md`), but it is
-**not yet resolved** and must be pinned down before the entry/expiry logic
-is implemented in code.
+`DAO_GAM_RULES.md` Section 5's "2 subsequent H1 candles" window is
+**resolved, `[V1_DECISION]`**: the H1 candle that activates the order (the
+one whose hour contains the qualifying M15 reaction) does **not** count.
+The limit order at `zone_center` is live starting from the **next** H1
+candle, for exactly 2 full H1 candles. See
+`tests/fixtures/04_expired_no_entry_touch/README.md` and
+`tests/fixtures/06_same_bar_entry_sl_conflict/README.md` for worked
+examples.

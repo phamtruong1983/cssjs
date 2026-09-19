@@ -21,17 +21,17 @@ low=1965, close=2000` (same correction as Fixture 01/03; caught by
 
 ## H1 bars after activation
 
-- idx 23 (`22:00Z`→ mislabelled, actually `23:00Z` per `h1.csv`):
-  `low = 2003`, stays **above** `entry = 2000.00` — no touch.
-- idx 24 (`2024-01-03T00:00:00Z`): `low = 2010`, still above `2000.00` —
-  no touch.
+- idx 23: the **activation bar** (M15 reaction fires there). Per
+  `DAO_GAM_RULES.md` Section 5 (`[V1_DECISION]`, resolved), this bar does
+  **not** count toward the validity window.
+- idx 24 (`2024-01-03T00:00:00Z`, window candle 1): `low = 2010`, stays
+  above `entry = 2000.00` — no touch.
+- idx 25 (`2024-01-03T01:00:00Z`, window candle 2): `low = 2015`, still
+  above `2000.00` — no touch.
 
-Per `DAO_GAM_RULES.md` Section 5, the validity window is "2 subsequent H1
-candles" from the bar the order becomes active; this fixture uses idx 23
-and idx 24 as that window (the inclusive-vs-exclusive counting question
-noted in `docs/DATA_SCHEMA.md` Section 9 does not affect this fixture,
-since price never touches `2000.00` in **either** candle regardless of
-which two-candle window is used).
+The validity window is exactly `{idx 24, idx 25}` (activation bar idx 23
+excluded, per the resolved rule in `docs/DATA_SCHEMA.md` Section 9). Price
+never touches `2000.00` in either window candle.
 
 ## Expected engine outcome
 

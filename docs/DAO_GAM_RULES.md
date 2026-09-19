@@ -83,7 +83,7 @@ Labels:
 | 3 | Support/resistance zone | `[V1_DECISION]` Fractal swing high/low, **N = 3** candles each side, on H1. A level only qualifies as a "strong" zone if it has **≥ 2 prior touches**. The zone is a **band**, not one price: `[zone_center − zone_width/2, zone_center + zone_width/2]`, with `zone_width` configurable (in ATR(14) units or absolute price, to be set at implementation time). | "Touch" definition (wick vs. close, tolerance) to be pinned down in code but does not need separate approval — it follows directly from the zone band above. |
 | 4 | Sweep candle | `[V1_DECISION]` ATR(14) computed on H1. Candle range must be **≥ 1.5 × ATR(14)**. The extreme (high for a resistance test, low for a support test) must pierce the zone boundary by **≥ 0.25 × ATR(14)**. | Both thresholds are user-locked for V1, not to be auto-tuned. |
 | 5 | Trap confirmation | `[V1_DECISION]` The H1 sweep candle must **close back inside the zone**. Additionally, M15 must show the "reversal reaction" defined in Section 4 (fully specified, `[V1_DECISION]`, no longer pending). The "3 confirmation candles" rule is explicitly **not** used in V1, since the book's Dao Gam section does not specify it. | See Section 4 for the exact M15 conditions and the max-wait window. |
-| 6 | Entry | `[V1_DECISION]` Signal is only created after the H1 candle that confirms the trap has **closed** AND the M15 reversal reaction (Section 4) has fired. Entry model is a **limit-order simulation at `zone_center`** (see Section 5 for the full fill/expiry logic) — never a market order, never the H1 close price. | Backtest must simulate this as a resting limit order, not an immediate fill. |
+| 6 | Entry | `[V1_DECISION]` Signal is only created after the H1 candle that confirms the trap has **closed** AND the M15 reversal reaction (Section 4) has fired (the "activation bar"). Entry model is a **limit-order simulation at `zone_center`**, live for exactly 2 full H1 candles **starting after** the activation bar (see Section 5 for the full fill/expiry logic) — never a market order, never the H1 close price. | Backtest must simulate this as a resting limit order, not an immediate fill. |
 | 7 | Stop-loss | `[V1_DECISION]` Beyond the sweep candle's extreme, buffer = **0.20 × ATR(14)**. | Same ATR(14)/H1 series as rule 4. |
 | 8 | Take-profit | `[V1_DECISION]` TP1 = nearest H1 swing high/low in the reversal direction. `key_zone_reference = zone_center` (chosen over near/far edge to avoid bias from variable zone width; `zone_low`/`zone_center`/`zone_high` are all stored on the signal for later sensitivity analysis). `sweep_amplitude = abs(sweep_extreme − zone_center)`. TP2 = `TP1 + sweep_amplitude` for BUY, `TP1 − sweep_amplitude` for SELL. **Signal is discarded (not logged as tradable) unless R:R to TP2 ≥ 2.0** (R:R computed against the `zone_center` entry price from rule 6/Section 5). | Formula and reference point are final for V1. |
 | 9 | "First/last 15 minutes of H1" | `[V1_DECISION]` **Not used as a filter in V1.** If M15 data is available, log which intra-hour bucket (0–15, 15–30, 30–45, 45–60 min) the confirming H1 close and the M15 reaction fall into, for the user's own offline review. | Purely observational logging, no gating logic. |
@@ -152,21 +152,26 @@ price below. This is a `[V1_DECISION]`, not a rule from the book.
 
 - Entry price = **`zone_center`**. No market order, no fill at the H1 close
   price.
-- The resting limit order becomes active only after: H1 sweep candle
+- The resting limit order becomes eligible only after: H1 sweep candle
   closed back inside the zone **AND** the M15 reversal reaction (Section
-  4) has fired.
-- **Validity window: 2 subsequent H1 candles (2 hours)** from the bar the
-  order becomes active. If price does not trade at `zone_center` within
-  that window, the order is marked **`EXPIRED`** and is **not counted as a
+  4) has fired. This is the **activation bar** (the H1 candle whose hour
+  contains the qualifying M15 reaction candle).
+- **Validity window, `[V1_DECISION]`: the activation bar itself does NOT
+  count.** The limit order is live starting from the **next H1 candle**
+  after the activation bar, for **exactly 2 full subsequent H1 candles**.
+  If price does not trade at `zone_center` during either of those 2
+  candles, the order is marked **`EXPIRED`** and is **not counted as a
   trade** (excluded from win rate / R-multiple stats, logged separately for
   audit).
-- **Same-bar SL-before-entry:** if, on an H1 candle within the validity
-  window, price touches both `zone_center` (entry) and the stop-loss level,
-  and there is no intrabar (sub-H1) data to establish order, treat it
-  **conservatively as no fill** — the order is not considered triggered on
-  that bar (it may still fill on a later bar within the window, if the SL
-  level was not also breached in the meantime; if the SL level was already
-  invalidated, the order expires/rejects — see note below).
+- **Same-bar SL-before-entry:** if, on one of the 2 validity-window H1
+  candles, price touches both `zone_center` (entry) and the stop-loss
+  level, and there is no intrabar (sub-H1) data to establish order, treat
+  it **conservatively as SL-before-entry: no fill occurs on that bar**. If
+  the stop-loss level was touched on that bar, the setup is treated as
+  invalidated from that point on (no fill is attempted on a later bar in
+  the window either) and logged as `EXPIRED`, since there is no
+  filled position to manage and the level the plan depends on has already
+  been breached.
 - **Same-bar SL-vs-TP after entry:** once filled, if a later H1 (or M15,
   for the parts of the trade managed intrabar) candle touches both the
   stop-loss and a take-profit level with no intrabar ordering data
@@ -192,7 +197,7 @@ approval before coding, but noted for transparency):
   - `EXPIRED` — H1 + M15 confirmed, limit order posted at `zone_center`,
     but price never traded there within the 2-H1-candle validity window
     (Section 5).
-  - `RR_BELOW_THRESHOLD` — setup fully confirmed but R:R to TP2 < 2.0
+  - `REJECTED_RR_BELOW_THRESHOLD` — setup fully confirmed but R:R to TP2 < 2.0
     (Section 3, rule 8).
 - Every record (signal or rejected/expired) includes a `reason` field
   (human-readable) and the concrete rule values that produced it: zone

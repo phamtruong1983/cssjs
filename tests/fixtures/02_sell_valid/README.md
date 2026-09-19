@@ -16,7 +16,11 @@ zone instead of support; swing low (not high) is the reversal target.
   - `h1_range = 81` (>= 15 ✓)
   - `pierce_depth = high(2035) - zone_high(2000.5) = 34.5` (>= 2.5 ✓)
   - `close = 2000.0` inside `[1999.5, 2000.5]` → trap confirmed.
-- idx 23: M15 reaction + entry-touch hour.
+- idx 23: the **activation bar** (M15 reaction fires). Per
+  `DAO_GAM_RULES.md` Section 5, this bar does **not** count toward the
+  entry validity window.
+- idx 24: the **first of the 2 validity-window H1 candles**, where price
+  touches the entry price.
 
 ## Derived values
 
@@ -44,15 +48,18 @@ construction as Fixture 01.
 
 | Candle | close | body/range | close_position | passes? |
 |---|---|---|---|---|
-| 23:00 | 1999 | 1/4 = 0.25 | 0.25 | fails (body ratio < 0.30) |
-| 23:15 | 1996 | 3/5 = 0.60 | (1996-1995)/5 = 0.20 | **fires** (close<2000, ratio>=0.30, close_position<=0.40) |
+| 23:00 | 1996 | 1/5 = 0.20 | (1996-1992)/5=0.80 | fails (body ratio < 0.30; also close_position doesn't satisfy `<=0.40`) |
+| 23:15 | 1990 | 6/9 = 0.667 | (1990-1988)/9=0.222 | **fires** (close<2000, ratio>=0.30, close_position<=0.40) |
 
 Reaction fires on the 2nd M15 candle, mirroring Fixture 01 exactly.
 
 ## Entry touch
 
-idx 23 H1 range `[1985, 2002]` spans `entry = 2000.00` → touched within
-the window. As with Fixture 01, this fixture stops at "entry touched," not
+Mirroring Fixture 01: idx 23 (the activation bar) has range `[1982, 1997]`,
+deliberately staying below `entry = 2000.00` so it does not pre-fill the
+order. idx 24 (`2024-01-03T00:00:00Z`), the first candle of the 2-H1-candle
+validity window, has range `[1980, 2002]`, which spans `entry = 2000.00`
+→ touched. As with Fixture 01, this fixture stops at "entry touched," not
 a full SL/TP resolution.
 
 ## Expected engine outcome
