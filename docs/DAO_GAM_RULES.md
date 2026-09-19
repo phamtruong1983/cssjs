@@ -82,68 +82,126 @@ Labels:
 | 2 | Volume spike | `[V1_DECISION]` **Not a required condition.** If the data source provides tick volume, log it (raw value + ratio to a rolling average) on every signal, but never reject a signal for volume. | XAUUSD tick volume via most retail feeds is a liquidity proxy, not real traded volume — treated as informational only. |
 | 3 | Support/resistance zone | `[V1_DECISION]` Fractal swing high/low, **N = 3** candles each side, on H1. A level only qualifies as a "strong" zone if it has **≥ 2 prior touches**. The zone is a **band**, not one price: `[zone_center − zone_width/2, zone_center + zone_width/2]`, with `zone_width` configurable (in ATR(14) units or absolute price, to be set at implementation time). | "Touch" definition (wick vs. close, tolerance) to be pinned down in code but does not need separate approval — it follows directly from the zone band above. |
 | 4 | Sweep candle | `[V1_DECISION]` ATR(14) computed on H1. Candle range must be **≥ 1.5 × ATR(14)**. The extreme (high for a resistance test, low for a support test) must pierce the zone boundary by **≥ 0.25 × ATR(14)**. | Both thresholds are user-locked for V1, not to be auto-tuned. |
-| 5 | Trap confirmation | `[V1_DECISION]` The H1 sweep candle must **close back inside the zone**. Additionally, M15 must show a defined "reversal reaction" — **definition pending, see Section 4, `NEEDS_APPROVAL`.** The "3 confirmation candles" rule is explicitly **not** used in V1, since the book's Dao Gam section does not specify it. | No code may implement the M15 check until Section 4 is approved. |
-| 6 | Entry | `[V1_DECISION]` Signal is only created after the H1 candle that confirms the trap has **closed**. Entry price is a **reference price at the old zone** (i.e., the zone band from rule 3), not a market order and not a price chased far from the zone. | Backtest must treat entry as a limit-style reference at the zone, filled only if price later revisits it (see open question in Section 5). |
+| 5 | Trap confirmation | `[V1_DECISION]` The H1 sweep candle must **close back inside the zone**. Additionally, M15 must show the "reversal reaction" defined in Section 4 (fully specified, `[V1_DECISION]`, no longer pending). The "3 confirmation candles" rule is explicitly **not** used in V1, since the book's Dao Gam section does not specify it. | See Section 4 for the exact M15 conditions and the max-wait window. |
+| 6 | Entry | `[V1_DECISION]` Signal is only created after the H1 candle that confirms the trap has **closed** AND the M15 reversal reaction (Section 4) has fired. Entry model is a **limit-order simulation at `zone_center`** (see Section 5 for the full fill/expiry logic) — never a market order, never the H1 close price. | Backtest must simulate this as a resting limit order, not an immediate fill. |
 | 7 | Stop-loss | `[V1_DECISION]` Beyond the sweep candle's extreme, buffer = **0.20 × ATR(14)**. | Same ATR(14)/H1 series as rule 4. |
-| 8 | Take-profit | `[V1_DECISION]` TP1 = nearest H1 swing high/low in the reversal direction. TP2 = `TP1 ± abs(extreme_sweep − key_zone_reference)` (sign per BUY/SELL direction). **Signal is discarded (not logged as tradable) unless R:R to TP2 ≥ 2.0.** | `key_zone_reference` = the zone boundary that was pierced (see Section 5 for the exact reference point to use, since the zone is a band not a single price). |
+| 8 | Take-profit | `[V1_DECISION]` TP1 = nearest H1 swing high/low in the reversal direction. `key_zone_reference = zone_center` (chosen over near/far edge to avoid bias from variable zone width; `zone_low`/`zone_center`/`zone_high` are all stored on the signal for later sensitivity analysis). `sweep_amplitude = abs(sweep_extreme − zone_center)`. TP2 = `TP1 + sweep_amplitude` for BUY, `TP1 − sweep_amplitude` for SELL. **Signal is discarded (not logged as tradable) unless R:R to TP2 ≥ 2.0** (R:R computed against the `zone_center` entry price from rule 6/Section 5). | Formula and reference point are final for V1. |
 | 9 | "First/last 15 minutes of H1" | `[V1_DECISION]` **Not used as a filter in V1.** If M15 data is available, log which intra-hour bucket (0–15, 15–30, 30–45, 45–60 min) the confirming H1 close and the M15 reaction fall into, for the user's own offline review. | Purely observational logging, no gating logic. |
 | 10 | Other indicators | `[V1_DECISION]` No MA, RSI, MACD, Bollinger Bands, or any other strategy layered into V1. | Detection uses only swing/fractal structure + ATR(14). |
 
-## 4. M15 "reversal reaction" — definition, `NEEDS_APPROVAL`
+## 4. M15 "reversal reaction" — definition, `[V1_DECISION]` (approved)
 
-**Status: not implemented. No code may reference or check this rule until
-the user approves a specific definition below (or a revision of it).**
+**Status: fully specified and approved for V1. This is a `[V1_DECISION]`,
+not a rule stated verbatim in the book** — the book does not describe any
+lower-timeframe confirmation step; this section formalizes what "reversal
+reaction" means so it can be checked mechanically.
 
 Purpose: after the H1 candle closes back inside the zone (trap confirmed
-on H1), we want a lower-timeframe check that the reversal is actually
-happening, rather than treating the H1 close alone as sufficient.
+on H1), require a lower-timeframe check that the reversal is actually
+underway, rather than treating the H1 close alone as sufficient.
 
-Proposed definition (draft, for the user to accept/reject/edit — labeled
-`[INFERRED]`, not derived from the book):
+Common terms:
+- `zone_center` — the midpoint of the support/resistance zone band (Section
+  3, rule 3).
+- `sweep_extreme` — the high (resistance case) or low (support case) of the
+  H1 sweep candle.
+- `body_size` — `abs(close − open)` of the M15 candle.
+- `candle_range` — `high − low` of the M15 candle.
+- `close_position_in_range` — `(close − low) / (high − low)` for the M15
+  candle (0 = closed at the low, 1 = closed at the high).
 
-> Reversal reaction (M15) = within the **first K completed M15 candles**
-> after the confirming H1 candle's close, price prints **at least one M15
-> candle** whose close moves **back toward the zone/away from the sweep
-> extreme** by at least `X × ATR15(period)`, **without** any M15 candle in
-> that window closing beyond the H1 sweep extreme (i.e., the trap is not
-> invalidated by a fresh, deeper sweep on M15).
+**BUY case** (price swept below the zone, looking for upward reversal):
 
-Open parameters inside this draft that also need the user's decision once
-the general shape is approved:
-- `K` — how many M15 candles constitute the confirmation window (candidate:
-  K = 2, i.e. up to 30 minutes after the H1 close).
-- `X` — minimum M15 close displacement, in ATR15 units (candidate: 0.3).
-- Whether "closing beyond the H1 sweep extreme" invalidates the setup
-  outright, or only downgrades confidence (V1 currently assumes outright
-  invalidation — signal is not emitted, only logged as
-  `REJECTED_M15_INVALIDATED` for audit).
-- ATR period on M15 (candidate: same 14, i.e. ATR15(14), independent series
-  from the H1 ATR(14) used elsewhere).
+After the sweep, scan the M15 candles that follow, up to a maximum of
+**4 M15 candles** (1 hour). The reversal reaction fires on the **first**
+M15 candle in that window whose close satisfies **all** of:
+  a) `close > zone_center`
+  b) `body_size / candle_range >= 0.30`
+  c) `close_position_in_range >= 0.60`
+  d) not a doji (excluded by condition b/c already requiring a real body
+     closing in the upper part of its range — no separate doji filter
+     needed beyond a) through c))
 
-Until this section is approved, the pipeline may compute and log raw M15
-values (closes, highs/lows, ATR15) for the confirmation window, but must
-**not** use them to accept/reject a signal, and must not claim the M15
-check has been "passed."
+If no M15 candle within the 4-candle window satisfies all conditions, the
+setup is invalidated: no signal is emitted, and it is logged as
+`REJECTED_M15_NO_REACTION`.
 
-## 5. Open implementation questions (not blocking, tracked for later)
+**SELL case** (price swept above the zone, looking for downward reversal):
+mirror image of the BUY case, over the same 4-candle window:
+  a) `close < zone_center`
+  b) `body_size / candle_range >= 0.30`
+  c) `close_position_in_range <= 0.40`
+  d) same note as BUY(d) — no separate doji filter needed.
 
+Additional V1 decisions for this section:
+- Engulfing pattern is **not required** in V1.
+- Tick volume is **not** a condition here either (consistent with Section
+  3, rule 2) — log it if available, never gate on it.
+- ATR15 is **not used** in this definition (superseded by the
+  body/range-ratio and close-position conditions above); no separate
+  ATR15 series needs to be computed for this check.
+- The pipeline must always log the raw M15 candles evaluated in the
+  window (OHLC, body_size, candle_range, close_position_in_range) whether
+  or not the reaction fires, for later review.
+
+## 5. Entry model — limit-order simulation, `[V1_DECISION]` (approved)
+
+`key_zone_reference` (Section 3 open question) is resolved: **`zone_center`**
+is used both as the TP2 reference (Section 3, rule 8) and as the entry
+price below. This is a `[V1_DECISION]`, not a rule from the book.
+
+- Entry price = **`zone_center`**. No market order, no fill at the H1 close
+  price.
+- The resting limit order becomes active only after: H1 sweep candle
+  closed back inside the zone **AND** the M15 reversal reaction (Section
+  4) has fired.
+- **Validity window: 2 subsequent H1 candles (2 hours)** from the bar the
+  order becomes active. If price does not trade at `zone_center` within
+  that window, the order is marked **`EXPIRED`** and is **not counted as a
+  trade** (excluded from win rate / R-multiple stats, logged separately for
+  audit).
+- **Same-bar SL-before-entry:** if, on an H1 candle within the validity
+  window, price touches both `zone_center` (entry) and the stop-loss level,
+  and there is no intrabar (sub-H1) data to establish order, treat it
+  **conservatively as no fill** — the order is not considered triggered on
+  that bar (it may still fill on a later bar within the window, if the SL
+  level was not also breached in the meantime; if the SL level was already
+  invalidated, the order expires/rejects — see note below).
+- **Same-bar SL-vs-TP after entry:** once filled, if a later H1 (or M15,
+  for the parts of the trade managed intrabar) candle touches both the
+  stop-loss and a take-profit level with no intrabar ordering data
+  available, assume **SL happens first** (conservative resolution).
+- No market orders anywhere in this model; no use of H1 close price as a
+  fill price at any stage.
+
+Remaining implementation-detail (non-blocking, does not require separate
+approval before coding, but noted for transparency):
 - Exact "touch" definition for the ≥2-touch zone rule (wick-based vs.
-  close-based, tolerance band).
-- Which zone boundary (near edge vs. center vs. far edge of the band) is
-  `key_zone_reference` in the TP2 formula, and which edge is the entry
-  reference price.
-- In backtest, how an "entry at the zone" reference price is treated if
-  price never returns exactly to it after the confirming H1 close (does
-  the signal expire, and after how long).
+  close-based, tolerance band) — to be pinned down in code following the
+  zone-band definition in Section 3, rule 3.
 
 ## 6. Signal status and output contract (V1)
 
-- Every emitted signal has `status = "NEEDS_MANUAL_REVIEW"`. V1 output must
-  never be labeled a recommendation or a certain trade.
-- Every signal record includes a `reason` field (human-readable) and the
-  concrete rule values that triggered it (zone bounds, ATR(14) value,
-  range multiple, pierce depth, sweep extreme, R:R to TP2, D1/H4 structure
-  snapshot, tick-volume snapshot if available, M15 bucket timing).
-- Output formats: JSON, console log, and CSV log — all three, same signal
-  data.
+- Every emitted, tradable signal has `status = "NEEDS_MANUAL_REVIEW"`. V1
+  output must never be labeled a recommendation or a certain trade.
+- Non-tradable outcomes are logged (for audit, not as signals) with their
+  own status, at minimum:
+  - `REJECTED_M15_NO_REACTION` — H1 trap confirmed, but no M15 candle
+    within the 4-candle window satisfied the reversal-reaction conditions
+    (Section 4).
+  - `EXPIRED` — H1 + M15 confirmed, limit order posted at `zone_center`,
+    but price never traded there within the 2-H1-candle validity window
+    (Section 5).
+  - `RR_BELOW_THRESHOLD` — setup fully confirmed but R:R to TP2 < 2.0
+    (Section 3, rule 8).
+- Every record (signal or rejected/expired) includes a `reason` field
+  (human-readable) and the concrete rule values that produced it: zone
+  bounds (`zone_low`/`zone_center`/`zone_high`), touch count, ATR(14)
+  value, H1 range multiple, pierce depth, `sweep_extreme`,
+  `sweep_amplitude`, the M15 reaction candle's OHLC/body/close-position
+  values, R:R to TP1 and TP2, D1/H4 structure snapshot, tick-volume
+  snapshot if available, and the intra-hour bucket (0–15/15–30/30–45/45–60
+  min) for both the H1 confirmation and the M15 reaction.
+- Output formats: JSON, console log, and CSV log — all three, same
+  underlying record (signals and rejected/expired entries alike).
 - No broker connectivity, no order placement, no auto trading in V1.
