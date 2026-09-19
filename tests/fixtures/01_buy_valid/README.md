@@ -80,3 +80,21 @@ resolution (that is backtest-engine scope, not yet built).
 
 A signal with `status = "NEEDS_MANUAL_REVIEW"`, `direction = "buy"`, and
 the level values above.
+
+## Update note
+
+`h1.csv` has 25 rows (idx 0–24): idx 22 is the sweep candle, idx 23 is
+the activation bar, and idx 24 is the first (and only) H1 candle of the
+2-candle entry-validity window present in this file (see "Structure"
+above — unchanged from what it already described).
+
+Checked against the current CSV with `find_swings(n=3)`: across the
+full 25-row file there is an additional fractal swing high at idx 21
+(`high = 2050.00`), beyond the idx 11 swing already listed above.
+However, it is confirmed only once data through idx 24 exists (`as_of=24`)
+— at the sweep candle's own decision point (`as_of = sweep_idx-1 = 21`
+for zone confirmation, and `used = df.iloc[:23]` for TP1 swing
+confirmation in `compute_risk_reward`), idx 21 has no bars after it and
+is not yet a confirmed swing. It therefore is not, and must not be,
+used by the pipeline at `sweep_idx = 22`. `tp1` remains the idx 11
+swing high (`2070.00`), as already stated above.

@@ -11,12 +11,18 @@ reaction conditions from `DAO_GAM_RULES.md` Section 4.
 | Candle | close | body | range | body/range | close_position | a) close>2000 | b) ratio>=0.30 | c) pos>=0.60 | passes? |
 |---|---|---|---|---|---|---|---|---|---|
 | 23:00 | 2000.5 | 0.5 | 2 | 0.25 | 0.75 | yes | **no** | yes | no |
-| 23:15 | 2000.8 | 0.3 | 3 | 0.10 | 0.60 | yes | **no** | yes | no |
+| 23:15 | 2000.8 | 0.3 | 3 | 0.10 | 0.27 | yes | **no** | **no** | no |
 | 23:30 | 1999.5 | 1.3 | 4 | 0.325 | 0.375 | **no** | yes | no | no |
 | 23:45 | 1998.0 | 1.5 | 4 | 0.375 | 0.25 | **no** | yes | no | no |
 
 No candle in the 4-candle window satisfies conditions a, b, and c
 simultaneously.
+
+Note: the `23:15` row's `close_position` and condition `c)` were
+corrected to match `m15.csv` (`close_position = (2000.8-2000)/3 = 0.27`,
+so `c) pos>=0.60` is `no`, not `0.60`/`yes` as an earlier draft had it).
+This does not change the row's overall `passes? = no` or the fixture's
+conclusion, since condition `b)` already fails on that candle.
 
 Note: the sweep hour's last M15 candle (`22:45`) is `open=1980, high=2000,
 low=1965, close=2000` (corrected from an invalid earlier draft where
