@@ -14,7 +14,15 @@ import pytest
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))), "src"))
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
-from src.market_structure.zones import create_zones  # noqa: E402
+from src.market_structure.swings import find_swings  # noqa: E402
+from src.market_structure.zones import (  # noqa: E402
+    RESULT_COLUMNS,
+    TICK,
+    _validate_as_of,
+    _validate_min_touches,
+    _validate_width,
+    create_zones,
+)
 
 FIXTURES_DIR = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "fixtures")
 
@@ -387,3 +395,129 @@ def test_fixture_02_lookahead_truncated_equals_full():
         full = create_zones(df, as_of=as_of, n=3)
         truncated = create_zones(df.iloc[: as_of + 1], as_of=as_of, n=3)
         pd.testing.assert_frame_equal(full.reset_index(drop=True), truncated.reset_index(drop=True))
+
+
+# ---------------------------------------------------------------------------
+# Performance-optimization equivalence: brute-force reference vs. the
+# current (vectorized touch-counting) create_zones. The brute-force body
+# below is copied VERBATIM from `git show HEAD:src/market_structure/zones.py`
+# (the O(P^2) touch-counting implementation) as of the commit immediately
+# before the numpy/searchsorted optimization, so this test proves the
+# optimization changed nothing observable.
+# ---------------------------------------------------------------------------
+
+
+def _round_tick_ref(x: float) -> float:
+    return round(round(x / TICK) * TICK, 10)
+
+
+def _create_zones_brute_force(
+    df: pd.DataFrame,
+    as_of: int,
+    n: int = 3,
+    width: float = 1.00,
+    min_touches: int = 2,
+) -> pd.DataFrame:
+    """Verbatim pre-optimization reference (O(P^2) touch counting)."""
+    _validate_as_of(as_of, len(df))
+    _validate_width(width)
+    _validate_min_touches(min_touches)
+
+    truncated = df.iloc[: as_of + 1]
+    swings = find_swings(truncated, n=n)
+
+    high = truncated["high"].to_numpy()
+    low = truncated["low"].to_numpy()
+
+    high_swing_positions = [i for i in range(len(truncated)) if bool(swings["is_swing_high"].iloc[i])]
+    low_swing_positions = [i for i in range(len(truncated)) if bool(swings["is_swing_low"].iloc[i])]
+
+    rows = []
+
+    for side, positions, prices in (
+        ("resistance", high_swing_positions, high),
+        ("support", low_swing_positions, low),
+    ):
+        for anchor_pos in positions:
+            center = float(prices[anchor_pos])
+            zone_low = _round_tick_ref(center - width / 2)
+            zone_high = _round_tick_ref(center + width / 2)
+
+            touch_idxs = [
+                p
+                for p in positions
+                if zone_low <= _round_tick_ref(float(prices[p])) <= zone_high
+            ]
+            touch_count = len(touch_idxs)
+
+            if touch_count >= min_touches:
+                rows.append(
+                    {
+                        "side": side,
+                        "anchor_idx": anchor_pos,
+                        "zone_center": center,
+                        "zone_low": zone_low,
+                        "zone_high": zone_high,
+                        "zone_width": float(width),
+                        "touch_count": touch_count,
+                        "touch_idxs": sorted(touch_idxs),
+                    }
+                )
+
+    if not rows:
+        return pd.DataFrame(columns=RESULT_COLUMNS)
+
+    return pd.DataFrame(rows, columns=RESULT_COLUMNS)
+
+
+def _make_synthetic_df(rng: np.random.Generator, length: int, grid: float, cluster: bool) -> pd.DataFrame:
+    """Synthetic OHLC-ish (high/low only) series with lots of repeated
+    values, on a fixed price grid, optionally with tight clusters of
+    near-identical prices (to stress the touch-counting boundary)."""
+    if cluster:
+        base = rng.choice(np.arange(90.0, 110.0, grid * 5), size=length)
+        noise = rng.integers(-2, 3, size=length) * grid
+        low = np.round(base + noise, 6)
+    else:
+        levels = np.round(np.arange(80.0, 120.0, grid), 6)
+        low = rng.choice(levels, size=length)
+    spread = rng.choice([grid, grid * 2, grid * 5, 1.0], size=length)
+    high = np.round(low + spread, 6)
+    return pd.DataFrame({"high": high, "low": low})
+
+
+@pytest.mark.parametrize("seed", list(range(30)))
+def test_create_zones_matches_brute_force_reference_synthetic(seed):
+    rng = np.random.default_rng(seed)
+    length = int(rng.integers(20, 401))
+    grid = float(rng.choice([0.005, 0.01]))
+    cluster = bool(rng.integers(0, 2))
+    df = _make_synthetic_df(rng, length, grid, cluster)
+
+    n = int(rng.choice([2, 3, 4]))
+    width = float(rng.choice([0.5, 1.0, 2.0]))
+    min_touches = int(rng.choice([1, 2, 3]))
+    as_of = int(rng.integers(max(2 * n, 1), length))
+
+    fast = create_zones(df, as_of=as_of, n=n, width=width, min_touches=min_touches)
+    ref = _create_zones_brute_force(df, as_of=as_of, n=n, width=width, min_touches=min_touches)
+
+    pd.testing.assert_frame_equal(
+        fast.reset_index(drop=True), ref.reset_index(drop=True), check_dtype=True
+    )
+
+
+REAL_H1_PATH = os.path.join(
+    os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "..", "data", "processed", "XAUUSD", "h1.csv"
+)
+
+
+@pytest.mark.skipif(not os.path.isfile(REAL_H1_PATH), reason="real dataset not present (never required in this repo)")
+@pytest.mark.parametrize("as_of", [200, 500, 900, 1400])
+def test_create_zones_matches_brute_force_reference_real_data_slice(as_of):
+    df = pd.read_csv(REAL_H1_PATH).iloc[:1500].reset_index(drop=True)
+
+    fast = create_zones(df, as_of=as_of, n=3, width=1.00, min_touches=2)
+    ref = _create_zones_brute_force(df, as_of=as_of, n=3, width=1.00, min_touches=2)
+
+    pd.testing.assert_frame_equal(fast.reset_index(drop=True), ref.reset_index(drop=True), check_dtype=True)

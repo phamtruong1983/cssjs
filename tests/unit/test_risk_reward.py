@@ -16,6 +16,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspa
 from src.indicators.atr import atr as compute_atr  # noqa: E402
 from src.risk.risk_reward import compute_risk_reward  # noqa: E402
 from src.market_structure.zones import TICK  # noqa: E402
+from src.market_structure.swings import find_swings  # noqa: E402
 
 FIXTURES_DIR = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "fixtures")
 
@@ -457,3 +458,121 @@ def test_stop_wrong_side_raises_due_to_tick_rounding_collision():
         compute_risk_reward(
             df, sweep_idx=6, direction="buy", zone_center=2000.0, sweep_extreme=1999.996, atr_h1_14=0.005
         )
+
+
+# ---------------------------------------------------------------------------
+# Performance-optimization equivalence: brute-force TP1 selection (copied
+# VERBATIM from `git show HEAD:src/risk/risk_reward.py`, the pre-vectorization
+# per-row `.iloc[i]` Python-loop implementation) vs. the current vectorized
+# (numpy) TP1 selection inside compute_risk_reward. Proves the optimization
+# changed nothing observable.
+# ---------------------------------------------------------------------------
+
+
+def _tick_ref(x: float) -> int:
+    return round(x / TICK)
+
+
+def _select_tp1_brute_force(used: pd.DataFrame, swings: pd.DataFrame, direction: str, entry_t: int):
+    """Verbatim pre-optimization reference TP1 selection."""
+    if direction == "buy":
+        candidates = [
+            i
+            for i in range(len(used))
+            if bool(swings["is_swing_high"].iloc[i]) and _tick_ref(float(used["high"].iloc[i])) > entry_t
+        ]
+        if candidates:
+            idx = max(candidates)
+            return idx, float(used["high"].iloc[idx])
+    else:
+        candidates = [
+            i
+            for i in range(len(used))
+            if bool(swings["is_swing_low"].iloc[i]) and _tick_ref(float(used["low"].iloc[i])) < entry_t
+        ]
+        if candidates:
+            idx = max(candidates)
+            return idx, float(used["low"].iloc[idx])
+    return None, None
+
+
+def _make_synthetic_hlc(rng: np.random.Generator, length: int) -> pd.DataFrame:
+    base = 100.0 + np.cumsum(rng.normal(0, 0.5, size=length))
+    spread = rng.uniform(0.2, 3.0, size=length)
+    low = np.round(base - spread / 2, 2)
+    high = np.round(base + spread / 2, 2)
+    close = np.round(rng.uniform(low, high), 2)
+    return pd.DataFrame({"high": high, "low": low, "close": close})
+
+
+@pytest.mark.parametrize("seed", list(range(20)))
+def test_tp1_selection_matches_brute_force_reference_synthetic(seed):
+    rng = np.random.default_rng(seed)
+    length = int(rng.integers(30, 200))
+    df = _make_synthetic_hlc(rng, length)
+    n = int(rng.choice([2, 3, 4]))
+    sweep_idx = int(rng.integers(2 * n + 1, length))
+    direction = "buy" if rng.integers(0, 2) == 0 else "sell"
+
+    zone_center = float(df["close"].iloc[sweep_idx])
+    atr_h1_14 = 1.0
+    sweep_extreme = zone_center - 5.0 if direction == "buy" else zone_center + 5.0
+
+    result = compute_risk_reward(
+        df,
+        sweep_idx=sweep_idx,
+        direction=direction,
+        zone_center=zone_center,
+        sweep_extreme=sweep_extreme,
+        atr_h1_14=atr_h1_14,
+        n=n,
+    )
+
+    used = df.iloc[: sweep_idx + 1]
+    swings = find_swings(used, n=n)
+    entry_t = _tick_ref(zone_center)
+    ref_idx, ref_tp1 = _select_tp1_brute_force(used, swings, direction, entry_t)
+
+    assert result.tp1_idx == ref_idx
+    if ref_tp1 is None:
+        assert result.tp1 is None
+        assert result.reason == "tp1_unavailable"
+    else:
+        assert result.tp1 == pytest.approx(ref_tp1)
+
+
+REAL_H1_PATH = os.path.join(
+    os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "..", "data", "processed", "XAUUSD", "h1.csv"
+)
+
+
+@pytest.mark.skipif(not os.path.isfile(REAL_H1_PATH), reason="real dataset not present (never required in this repo)")
+@pytest.mark.parametrize("sweep_idx", [200, 500, 900, 1400])
+def test_tp1_selection_matches_brute_force_reference_real_data_slice(sweep_idx):
+    df = pd.read_csv(REAL_H1_PATH).iloc[:1500].reset_index(drop=True)
+    n = 3
+    for direction in ("buy", "sell"):
+        zone_center = float(df["close"].iloc[sweep_idx])
+        atr_h1_14 = 1.0
+        sweep_extreme = zone_center - 5.0 if direction == "buy" else zone_center + 5.0
+
+        result = compute_risk_reward(
+            df,
+            sweep_idx=sweep_idx,
+            direction=direction,
+            zone_center=zone_center,
+            sweep_extreme=sweep_extreme,
+            atr_h1_14=atr_h1_14,
+            n=n,
+        )
+
+        used = df.iloc[: sweep_idx + 1]
+        swings = find_swings(used, n=n)
+        entry_t = _tick_ref(zone_center)
+        ref_idx, ref_tp1 = _select_tp1_brute_force(used, swings, direction, entry_t)
+
+        assert result.tp1_idx == ref_idx
+        if ref_tp1 is None:
+            assert result.tp1 is None
+        else:
+            assert result.tp1 == pytest.approx(ref_tp1)

@@ -63,6 +63,7 @@ docs/DATA_SCHEMA.md, decided here):
 """
 from __future__ import annotations
 
+import numpy as np
 import pandas as pd
 
 from .swings import find_swings
@@ -158,8 +159,8 @@ def create_zones(
     high = truncated["high"].to_numpy()
     low = truncated["low"].to_numpy()
 
-    high_swing_positions = [i for i in range(len(truncated)) if bool(swings["is_swing_high"].iloc[i])]
-    low_swing_positions = [i for i in range(len(truncated)) if bool(swings["is_swing_low"].iloc[i])]
+    high_swing_positions = np.flatnonzero(swings["is_swing_high"].to_numpy())
+    low_swing_positions = np.flatnonzero(swings["is_swing_low"].to_numpy())
 
     rows = []
 
@@ -167,29 +168,45 @@ def create_zones(
         ("resistance", high_swing_positions, high),
         ("support", low_swing_positions, low),
     ):
+        if len(positions) == 0:
+            continue
+
+        # Touch counting used to be an O(P^2) scan (for every anchor,
+        # rescan every position and re-round its price). Instead, round
+        # every candidate position's price once (same _round_tick as
+        # before, same float comparison semantics), sort that array once,
+        # and use numpy.searchsorted per anchor -- O(P log P) total
+        # instead of O(P^2). Result (row order, touch_idxs order, values,
+        # dtypes) is unchanged; see tests/unit/test_zones.py for the
+        # brute-force equivalence tests.
+        rounded_prices = np.fromiter(
+            (_round_tick(float(prices[p])) for p in positions), dtype=float, count=len(positions)
+        )
+        order = np.argsort(rounded_prices, kind="stable")
+        sorted_rounded = rounded_prices[order]
+        sorted_positions = positions[order]
+
         for anchor_pos in positions:
             center = float(prices[anchor_pos])
             zone_low = _round_tick(center - width / 2)
             zone_high = _round_tick(center + width / 2)
 
-            touch_idxs = [
-                p
-                for p in positions
-                if zone_low <= _round_tick(float(prices[p])) <= zone_high
-            ]
+            lo = np.searchsorted(sorted_rounded, zone_low, side="left")
+            hi = np.searchsorted(sorted_rounded, zone_high, side="right")
+            touch_idxs = sorted(int(p) for p in sorted_positions[lo:hi])
             touch_count = len(touch_idxs)
 
             if touch_count >= min_touches:
                 rows.append(
                     {
                         "side": side,
-                        "anchor_idx": anchor_pos,
+                        "anchor_idx": int(anchor_pos),
                         "zone_center": center,
                         "zone_low": zone_low,
                         "zone_high": zone_high,
                         "zone_width": float(width),
                         "touch_count": touch_count,
-                        "touch_idxs": sorted(touch_idxs),
+                        "touch_idxs": touch_idxs,
                     }
                 )
 

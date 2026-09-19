@@ -251,27 +251,30 @@ def compute_risk_reward(
     # TP1: nearest-in-time confirmed swing on the reversal side (see
     # module docstring TP1 SELECTION / ASSUMPTIONS). Comparison against
     # entry is done in integer ticks (SWING SELECTION COMPARISON above).
+    # Vectorized (numpy) instead of a per-row `.iloc[i]` Python loop --
+    # same strict two-sided comparison, same N-candle edge bands (still
+    # all False, unchanged, from find_swings), same tick-integer
+    # comparison against entry; see tests/unit/test_risk_reward.py for
+    # the brute-force equivalence tests.
     swings = find_swings(used, n=n)
     tp1 = None
     tp1_idx = None
     if direction == "buy":
-        candidates = [
-            i
-            for i in range(len(used))
-            if bool(swings["is_swing_high"].iloc[i]) and _tick(float(used["high"].iloc[i])) > entry_t
-        ]
-        if candidates:
-            tp1_idx = max(candidates)
-            tp1 = float(used["high"].iloc[tp1_idx])
+        is_swing_high = swings["is_swing_high"].to_numpy()
+        highs = used["high"].to_numpy()
+        high_ticks = np.round(highs / TICK).astype(np.int64)
+        candidate_idxs = np.flatnonzero(is_swing_high & (high_ticks > entry_t))
+        if candidate_idxs.size:
+            tp1_idx = int(candidate_idxs[-1])
+            tp1 = float(highs[tp1_idx])
     else:
-        candidates = [
-            i
-            for i in range(len(used))
-            if bool(swings["is_swing_low"].iloc[i]) and _tick(float(used["low"].iloc[i])) < entry_t
-        ]
-        if candidates:
-            tp1_idx = max(candidates)
-            tp1 = float(used["low"].iloc[tp1_idx])
+        is_swing_low = swings["is_swing_low"].to_numpy()
+        lows = used["low"].to_numpy()
+        low_ticks = np.round(lows / TICK).astype(np.int64)
+        candidate_idxs = np.flatnonzero(is_swing_low & (low_ticks < entry_t))
+        if candidate_idxs.size:
+            tp1_idx = int(candidate_idxs[-1])
+            tp1 = float(lows[tp1_idx])
 
     if tp1 is None:
         return RiskRewardResult(
