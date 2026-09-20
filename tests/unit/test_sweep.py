@@ -428,3 +428,204 @@ def test_no_lookahead_data_after_idx_does_not_affect_result():
     result_after = detect_sweep(df_mutated, atr_mutated, idx=22, zone=SUPPORT_ZONE)
 
     assert result_before == result_after
+
+
+# ---------------------------------------------------------------------------
+# Ceil-integer-tick threshold comparison (not round-to-nearest-tick)
+# ---------------------------------------------------------------------------
+
+
+def make_base_df_with_range(bar_range, sweep_open, sweep_high, sweep_low, sweep_close):
+    """22 bars (idx 0-21) with True Range == bar_range exactly (same
+    construction as make_base_df, generalized to an arbitrary constant
+    range), so atr.iloc[21] == bar_range exactly, followed by one custom
+    sweep candle at idx 22."""
+    rows = []
+    price = 2000.0
+    for _ in range(22):
+        rows.append((price, price + bar_range, price, price + bar_range))
+        price += bar_range
+    rows.append((sweep_open, sweep_high, sweep_low, sweep_close))
+    return pd.DataFrame(rows, columns=["open", "high", "low", "close"])
+
+
+# (a) atr=10.0 (existing base-history helper): range/pierce boundary,
+# hand-computed thresholds 1.5*10=15.00 and 0.25*10=2.50 -- unchanged
+# from prior (round-to-nearest-tick) behavior at these exact values.
+
+
+def test_ceil_threshold_atr_10_range_15_00_passes():
+    low = 2219.50 - 5.0  # pierce = 5.0, comfortably >= 2.50
+    high = low + 15.00
+    df = make_base_df(2220, high, low, 2220.0)
+    atr = compute_atr(df, period=14)
+    result = detect_sweep(df, atr, idx=22, zone=SUPPORT_ZONE)
+    assert result.atr_h1_14 == pytest.approx(10.0)
+    assert result.h1_range == pytest.approx(15.00)
+    assert result.range_ok is True
+
+
+def test_ceil_threshold_atr_10_range_14_99_fails():
+    low = 2219.50 - 5.0
+    high = low + 14.99
+    df = make_base_df(2220, high, low, 2220.0)
+    atr = compute_atr(df, period=14)
+    result = detect_sweep(df, atr, idx=22, zone=SUPPORT_ZONE)
+    assert result.h1_range == pytest.approx(14.99)
+    assert result.range_ok is False
+
+
+def test_ceil_threshold_atr_10_pierce_2_50_passes():
+    high = 2219.50 + 20.0  # range huge, comfortably >= 15.00
+    low = 2219.50 - 2.50
+    df = make_base_df(2220, high, low, 2220.0)
+    atr = compute_atr(df, period=14)
+    result = detect_sweep(df, atr, idx=22, zone=SUPPORT_ZONE)
+    assert result.pierce_depth == pytest.approx(2.50)
+    assert result.pierce_ok is True
+
+
+def test_ceil_threshold_atr_10_pierce_2_49_fails():
+    high = 2219.50 + 20.0
+    low = 2219.50 - 2.49
+    df = make_base_df(2220, high, low, 2220.0)
+    atr = compute_atr(df, period=14)
+    result = detect_sweep(df, atr, idx=22, zone=SUPPORT_ZONE)
+    assert result.pierce_depth == pytest.approx(2.49)
+    assert result.pierce_ok is False
+
+
+# (b) atr=2.63465: 1.5*atr = 3.951975 -> ceil-to-tick threshold is 3.96
+# (NOT 3.95, which round-to-nearest-tick would have wrongly produced).
+# 0.25*atr = 0.6586625 -> ceil-to-tick threshold is 0.66 (hand-verified:
+# ceil(65.86625) == 66 ticks == 0.66, so 0.66 PASSES; 0.65 (65 ticks)
+# fails). This corrects the task prompt's own hand-check, which claimed
+# 0.66 fails -- per the ceil rule that value is exactly at the threshold
+# and must pass ("must pierce ... by >= 0.25 x ATR(14)" is inclusive of
+# the boundary, per this module's ASSUMPTIONS).
+
+
+def test_ceil_threshold_atr_2_63465_range_3_95_fails():
+    low = 2219.50 - 5.0
+    high = low + 3.95
+    df = make_base_df_with_range(2.63465, low, high, low, high)
+    atr = compute_atr(df, period=14)
+    assert atr.iloc[21] == pytest.approx(2.63465)
+    result = detect_sweep(df, atr, idx=22, zone=SUPPORT_ZONE)
+    assert result.h1_range == pytest.approx(3.95)
+    assert result.range_ok is False
+
+
+def test_ceil_threshold_atr_2_63465_range_3_96_passes():
+    low = 2219.50 - 5.0
+    high = low + 3.96
+    df = make_base_df_with_range(2.63465, low, high, low, high)
+    atr = compute_atr(df, period=14)
+    result = detect_sweep(df, atr, idx=22, zone=SUPPORT_ZONE)
+    assert result.h1_range == pytest.approx(3.96)
+    assert result.range_ok is True
+
+
+def test_ceil_threshold_atr_2_63465_pierce_0_65_fails():
+    high = 2219.50 + 20.0  # range huge, comfortably >= 3.96
+    low = 2219.50 - 0.65
+    df = make_base_df_with_range(2.63465, 2220, high, low, 2220.0)
+    atr = compute_atr(df, period=14)
+    result = detect_sweep(df, atr, idx=22, zone=SUPPORT_ZONE)
+    assert result.pierce_depth == pytest.approx(0.65)
+    assert result.pierce_ok is False
+
+
+def test_ceil_threshold_atr_2_63465_pierce_0_66_passes():
+    # Corrects the task prompt's own hand-check (see comment above): the
+    # exact ceil-tick threshold for 0.25*2.63465 is 66 ticks = 0.66, and
+    # the rule's ">=" is inclusive, so 0.66 must PASS, not fail.
+    high = 2219.50 + 20.0
+    low = 2219.50 - 0.66
+    df = make_base_df_with_range(2.63465, 2220, high, low, 2220.0)
+    atr = compute_atr(df, period=14)
+    result = detect_sweep(df, atr, idx=22, zone=SUPPORT_ZONE)
+    assert result.pierce_depth == pytest.approx(0.66)
+    assert result.pierce_ok is True
+
+
+def test_ceil_threshold_atr_2_63465_pierce_0_67_passes():
+    high = 2219.50 + 20.0
+    low = 2219.50 - 0.67
+    df = make_base_df_with_range(2.63465, 2220, high, low, 2220.0)
+    atr = compute_atr(df, period=14)
+    result = detect_sweep(df, atr, idx=22, zone=SUPPORT_ZONE)
+    assert result.pierce_depth == pytest.approx(0.67)
+    assert result.pierce_ok is True
+
+
+# (c) ATR values where 1.5*atr lands exactly on a tick (2.6, 4.2, 5.8,
+# 6.6 -> 3.90, 6.30, 8.70, 9.90): range == 1.5*atr passes; one tick lower
+# fails. Guards against binary-float noise making the exact-equality case
+# wrongly fail (e.g. 1.5*atr computed as 3.9000000000000004).
+
+
+@pytest.mark.parametrize(
+    "bar_atr,threshold_price",
+    [(2.6, 3.90), (4.2, 6.30), (5.8, 8.70), (6.6, 9.90)],
+)
+def test_ceil_threshold_exact_tick_boundary_range(bar_atr, threshold_price):
+    low = 2219.50 - 5.0
+
+    high_pass = low + threshold_price
+    df_pass = make_base_df_with_range(bar_atr, low, high_pass, low, high_pass)
+    atr_pass = compute_atr(df_pass, period=14)
+    assert atr_pass.iloc[21] == pytest.approx(bar_atr)
+    result_pass = detect_sweep(df_pass, atr_pass, idx=22, zone=SUPPORT_ZONE)
+    assert result_pass.h1_range == pytest.approx(threshold_price)
+    assert result_pass.range_ok is True
+
+    high_fail = low + threshold_price - 0.01
+    df_fail = make_base_df_with_range(bar_atr, low, high_fail, low, high_fail)
+    atr_fail = compute_atr(df_fail, period=14)
+    result_fail = detect_sweep(df_fail, atr_fail, idx=22, zone=SUPPORT_ZONE)
+    assert result_fail.h1_range == pytest.approx(threshold_price - 0.01)
+    assert result_fail.range_ok is False
+
+
+# (d) Extreme ATR values (very small / very large): no error, correct
+# ceil-tick threshold.
+
+
+def test_ceil_threshold_tiny_atr_no_error():
+    bar_atr = 0.001
+    low = 2219.50 - 5.0  # pierce = 5.0, comfortably above the tiny threshold
+
+    high_pass = low + 0.01  # threshold ticks = ceil(1.5*0.001/0.01) = 1 -> 0.01
+    df_pass = make_base_df_with_range(bar_atr, low, high_pass, low, high_pass)
+    atr_pass = compute_atr(df_pass, period=14)
+    assert atr_pass.iloc[21] == pytest.approx(0.001)
+    result_pass = detect_sweep(df_pass, atr_pass, idx=22, zone=SUPPORT_ZONE)
+    assert result_pass.h1_range == pytest.approx(0.01)
+    assert result_pass.range_ok is True
+
+    df_fail = make_base_df_with_range(bar_atr, low, low, low, low)  # high == low -> range 0.00
+    atr_fail = compute_atr(df_fail, period=14)
+    result_fail = detect_sweep(df_fail, atr_fail, idx=22, zone=SUPPORT_ZONE)
+    assert result_fail.h1_range == pytest.approx(0.0)
+    assert result_fail.range_ok is False
+
+
+def test_ceil_threshold_huge_atr_no_error():
+    bar_atr = 100.0
+    low = 2219.50 - 30.0  # pierce = 30.0, comfortably above the 25.0 pierce threshold
+
+    high_pass = low + 150.00  # threshold ticks = ceil(1.5*100/0.01) = 15000 -> 150.00
+    df_pass = make_base_df_with_range(bar_atr, 2220, high_pass, low, 2220.0)
+    atr_pass = compute_atr(df_pass, period=14)
+    assert atr_pass.iloc[21] == pytest.approx(100.0)
+    result_pass = detect_sweep(df_pass, atr_pass, idx=22, zone=SUPPORT_ZONE)
+    assert result_pass.h1_range == pytest.approx(150.00)
+    assert result_pass.range_ok is True
+
+    high_fail = low + 149.99
+    df_fail = make_base_df_with_range(bar_atr, 2220, high_fail, low, 2220.0)
+    atr_fail = compute_atr(df_fail, period=14)
+    result_fail = detect_sweep(df_fail, atr_fail, idx=22, zone=SUPPORT_ZONE)
+    assert result_fail.h1_range == pytest.approx(149.99)
+    assert result_fail.range_ok is False

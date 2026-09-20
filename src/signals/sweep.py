@@ -49,8 +49,23 @@ ASSUMPTIONS (not specified in the docs, decided here):
   - Float/tick rounding: `h1_range`, `pierce_depth`, and `close` are
     rounded to the nearest tick (`TICK`, imported from
     `src.market_structure.zones` -- the same public constant `create_zones`
-    uses, not a private helper) before every threshold comparison, to
-    avoid spurious pass/fail from binary floating-point noise.
+    uses, not a private helper) before use, to avoid spurious pass/fail
+    from binary floating-point noise in the MEASURED values.
+  - `range_ok`/`pierce_ok` EXACT integer-tick comparison: `h1_range` and
+    `pierce_depth` are true multiples of `TICK` (real price data quantized
+    to the instrument's tick size), so the mathematically correct pass
+    bar for "`h1_range >= 1.5*atr_h1_14`" (resp. "`pierce_depth >=
+    0.25*atr_h1_14`") is the SMALLEST tick count that is `>=` the exact,
+    generally-fractional threshold -- i.e. `range_t >= ceil(1.5*atr_h1_14
+    / TICK)` compared as integers (`range_t = round(h1_range / TICK)`),
+    NOT `h1_range >= round_to_nearest_tick(1.5*atr_h1_14)`. Rounding the
+    threshold to the NEAREST tick instead of `ceil` would incorrectly
+    admit a measured value up to half a tick short of the true threshold
+    (e.g. `atr_h1_14 = 2.63465` -> threshold `3.952` -> nearest-tick
+    rounding gives `3.95`, wrongly passing a `3.95` range that is actually
+    `0.002` below the true `1.5x` bar; `ceil` correctly requires `3.96`).
+    See `_TICK_THRESHOLD_EPS` for why a tiny epsilon is subtracted before
+    `ceil` (pure floating-point-noise absorption, not a rule change).
   - `reason` codes (short, deliberately distinct from any status name in
     `docs/DAO_GAM_RULES.md` Section 6 / `docs/DATA_SCHEMA.md` Section 8 --
     this module never assigns a pipeline status, only a local mechanical
@@ -71,12 +86,25 @@ ASSUMPTIONS (not specified in the docs, decided here):
 """
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass
 from typing import Mapping
 
 import pandas as pd
 
 from src.market_structure.zones import TICK
+
+# Tolerance subtracted before `math.ceil` when converting a threshold
+# (`1.5*atr`/`0.25*atr`) from price units to an integer tick count. Both
+# `h1_range`/`pierce_depth` (the measured side) and the true threshold are
+# exact integer multiples of TICK in reality, but `1.5*atr_h1_14/TICK`
+# computed in binary floating point can land a hair BELOW an integer that
+# it should exactly equal (e.g. `3.9999999999999996` instead of `4.0`),
+# which would make `ceil` round up to the wrong (one-tick-too-high)
+# threshold. Subtracting a tiny EPS before `ceil` absorbs that noise
+# without ever being large enough to shift a genuinely fractional value
+# (e.g. `3.95`) down to the next-lower integer.
+_TICK_THRESHOLD_EPS = 1e-9
 
 VALID_SIDES = ("support", "resistance")
 REQUIRED_COLUMNS = ["high", "low", "close"]
@@ -215,13 +243,24 @@ def detect_sweep(df: pd.DataFrame, atr: pd.Series, idx: int, zone: Mapping) -> S
     atr_h1_14 = float(atr.iloc[idx - 1])
     range_multiple = h1_range / atr_h1_14
 
-    range_ok = h1_range >= _round_tick(1.5 * atr_h1_14)
+    # Compare in integer ticks against a threshold rounded UP (ceil), not
+    # to the NEAREST tick: h1_range/pierce_depth are real, tick-quantized
+    # measurements, so the correct pass bar for "value >= 1.5*atr" (resp.
+    # "0.25*atr") is the smallest tick count that is >= the exact
+    # (generally fractional) threshold -- i.e. ceil, never round-to-nearest
+    # (which would incorrectly let a value up to half a tick short of the
+    # true threshold pass). See module docstring / `_TICK_THRESHOLD_EPS`.
+    range_t = round(h1_range / TICK)
+    range_threshold_t = math.ceil(1.5 * atr_h1_14 / TICK - _TICK_THRESHOLD_EPS)
+    range_ok = range_t >= range_threshold_t
 
     if side == "support":
         pierce_depth = _round_tick(zone_low - low)
     else:
         pierce_depth = _round_tick(high - zone_high)
-    pierce_ok = pierce_depth >= _round_tick(0.25 * atr_h1_14)
+    pierce_t = round(pierce_depth / TICK)
+    pierce_threshold_t = math.ceil(0.25 * atr_h1_14 / TICK - _TICK_THRESHOLD_EPS)
+    pierce_ok = pierce_t >= pierce_threshold_t
 
     closed_back_inside = _round_tick(zone_low) <= _round_tick(close) <= _round_tick(zone_high)
 
