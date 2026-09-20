@@ -77,13 +77,13 @@ ASSUMPTIONS / OPEN QUESTIONS (not specified in the docs, decided here):
     would need a documented decision (new status, or folding it into
     `REJECTED_RR_BELOW_THRESHOLD`, or something else) before this could
     change.
-  - `rr1` (`docs/DATA_SCHEMA.md` Section 6) is not populated:
-    `compute_risk_reward` only returns `reward_to_tp2`/`rr_to_tp2` (R:R to
-    TP2, the only ratio the rules doc gates on) -- it does not compute
-    TP1's own R:R. `EngineResult` has no `rr1` field because no submodule
-    is the source of that value; adding it would mean this engine
-    computing it itself, which is out of scope (engine does not
-    recompute numbers).
+  - `rr1` (`docs/DATA_SCHEMA.md` Section 6) IS populated, as
+    `EngineResult.rr_to_tp1` -- forwarded verbatim from
+    `compute_risk_reward`'s own `rr_to_tp1` field wherever `rr_to_tp2` is
+    also populated. Per `DAO_GAM_RULES.md` Section 3 rule 8, only R:R to
+    TP2 gates `tradable`/`status`; `rr_to_tp1` is carried through for
+    REFERENCE ONLY and never used by this engine (or `compute_risk_reward`)
+    to gate anything.
   - `direction` for the winning zone is `"buy"` for a `support` zone,
     `"sell"` for a `resistance` zone (matches `sweep.py`'s own mapping,
     reused verbatim from `SweepResult.direction`, not recomputed).
@@ -121,22 +121,21 @@ parameter, default `1.00`) is passed to `create_zones` unchanged, and
 `EngineResult.zone_width_mode` is `"absolute"`. When `zone_width_atr` is
 not `None`, it OVERRIDES `zone_width` entirely (the absolute parameter is
 ignored, and this is deliberate, not a bug): the effective width is
-`zone_width_atr * atr.iloc[sweep_idx-1]` (the same already-closed ATR
-`detect_sweep` itself gates on), rounded to the nearest whole tick via
-`round(x / TICK)` (`TICK` from `src.market_structure.zones`), with a
-floor of 1 tick, and `EngineResult.zone_width_mode` is `"atr"`. Either
-way, the width actually used is recorded in `EngineResult.
-zone_width_used`; both `zone_width_used`/`zone_width_mode` are `None`
-only when the pipeline never reaches the zone-creation step at all
-(`stage="atr_unavailable"` or a `range_prefilter` short-circuit) --
-every stage from `create_zones` onward (including `"no_trap"`) has them
-populated. `zone_width_atr` must be a finite real number `> 0` (not
-`bool`); invalid values raise `TypeError` (wrong type, including `bool`)
-or `ValueError` (non-finite or `<= 0`), checked unconditionally at the
-top of `evaluate_sweep_candidate`, before any other stage runs.
-`range_prefilter`'s own `1.5*atr` threshold check is unaffected by
-`zone_width_atr` -- it is about the sweep candle's range, not the zone
-band.
+computed by `zone_width_from_atr(zone_width_atr, atr.iloc[sweep_idx-1])`
+(the same already-closed ATR `detect_sweep` itself gates on) -- see that
+function's own docstring for why the result is always an EVEN number of
+ticks -- and `EngineResult.zone_width_mode` is `"atr"`. Either way, the
+width actually used is recorded in `EngineResult.zone_width_used`; both
+`zone_width_used`/`zone_width_mode` are `None` only when the pipeline
+never reaches the zone-creation step at all (`stage="atr_unavailable"`
+or a `range_prefilter` short-circuit) -- every stage from `create_zones`
+onward (including `"no_trap"`) has them populated. `zone_width_atr` must
+be a finite real number `> 0` (not `bool`); invalid values raise
+`TypeError` (wrong type, including `bool`) or `ValueError` (non-finite or
+`<= 0`), checked unconditionally at the top of `evaluate_sweep_candidate`,
+before any other stage runs. `range_prefilter`'s own `1.5*atr` threshold
+check is unaffected by `zone_width_atr` -- it is about the sweep candle's
+range, not the zone band.
 
 MODULE 8b -- `annotate_repeats` (`D2`): a public function,
 `annotate_repeats(results: list[EngineResult]) -> list[EngineResult]`,
@@ -203,6 +202,35 @@ def _validate_zone_width_atr(zone_width_atr) -> float:
     if value <= 0:
         raise ValueError(f"zone_width_atr must be > 0, got {zone_width_atr!r}")
     return value
+
+
+def zone_width_from_atr(zone_width_atr: float, atr_prev: float) -> float:
+    """Convert an ATR-relative width factor into an absolute-price zone
+    width, always an EVEN number of ticks (module 8b, `D1` refinement).
+
+    A zone band is `[zone_center - width/2, zone_center + width/2]`
+    (`create_zones`); `zone_center` itself always sits exactly on a tick
+    (it is a real quoted price). If `width` were an ODD number of ticks,
+    `width/2` would land on a HALF-tick, so the band's own edges would no
+    longer sit on the tick grid at all -- and computing each edge
+    independently (`round(center - width/2)` / `round(center +
+    width/2)`) can then round in different directions for the same
+    half-tick distance (banker's rounding, plus binary-float noise on
+    `width/2` itself), making the band's actual on-grid half-width differ
+    above vs. below `zone_center` by a whole tick. Restricting `width` to
+    an EVEN tick count keeps `width/2` itself an exact whole number of
+    ticks, so both edges round identically and the band is symmetric by
+    construction.
+
+    `half_ticks = max(floor(zone_width_atr*atr_prev/(2*TICK) + 0.5 + EPS), 1)`
+    (round-half-up on the number of ticks in HALF the raw width, `EPS =
+    1e-9` absorbing the same binary-float noise `_TICK_THRESHOLD_EPS`
+    guards against in `sweep.py`, floored at 1 half-tick so the result is
+    never zero); the returned width is `2 * half_ticks * TICK` -- always
+    even, always `>= 2*TICK`.
+    """
+    half_ticks = max(math.floor(zone_width_atr * atr_prev / (2 * TICK) + 0.5 + 1e-9), 1)
+    return round(2 * half_ticks * TICK, 10)
 
 
 STATUS_NEEDS_MANUAL_REVIEW = "NEEDS_MANUAL_REVIEW"
@@ -403,9 +431,7 @@ def evaluate_sweep_candidate(
         zone_width_mode = "absolute"
     else:
         atr_prev = float(atr.iloc[sweep_idx - 1])
-        raw_width = _validate_zone_width_atr(zone_width_atr) * atr_prev
-        ticks = max(round(raw_width / TICK), 1)
-        effective_width = round(ticks * TICK, 10)
+        effective_width = zone_width_from_atr(_validate_zone_width_atr(zone_width_atr), atr_prev)
         zone_width_mode = "atr"
 
     zones_df = create_zones(h1_df, as_of=sweep_idx - 1, n=n, width=effective_width, min_touches=min_touches)

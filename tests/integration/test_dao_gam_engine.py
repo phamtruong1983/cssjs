@@ -20,6 +20,7 @@ from src.engine.dao_gam_engine import (  # noqa: E402
     annotate_repeats,
     evaluate_sweep_candidate,
     run_engine,
+    zone_width_from_atr,
 )
 
 FIXTURES_DIR = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "fixtures")
@@ -876,3 +877,48 @@ def test_d4_stop_breach_field_present_via_run_engine():
     results = run_engine(h1, m15)
     assert len(results) == 1
     assert results[0].stop_breached_in_activation_hour is False
+
+
+# ---------------------------------------------------------------------------
+# Module 8b -- zone_width_from_atr (even-tick ATR-relative zone width)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "zone_width_atr,atr_prev,expected",
+    [
+        (0.10, 10.0, 1.00),
+        (0.10, 6.9, 0.70),  # 0.69 sits between 0.68/0.70 -> round-half-up
+        (0.10, 6.8, 0.68),
+        (0.10, 0.05, 0.02),  # floor of 2 ticks (1 half-tick)
+        (0.20, 2.63465, 0.52),  # 0.52693/0.02 = 26.35 -> rounds to 26
+    ],
+)
+def test_zone_width_from_atr_hand_computed(zone_width_atr, atr_prev, expected):
+    assert zone_width_from_atr(zone_width_atr, atr_prev) == pytest.approx(expected)
+
+
+@pytest.mark.parametrize("seed", list(range(50)))
+def test_zone_width_from_atr_always_even_tick_multiple(seed):
+    rng = np.random.default_rng(seed)
+    zone_width_atr = float(rng.uniform(0.01, 2.0))
+    atr_prev = float(rng.uniform(0.001, 200.0))
+    width = zone_width_from_atr(zone_width_atr, atr_prev)
+    ticks = width / 0.02
+    assert ticks == pytest.approx(round(ticks)), (zone_width_atr, atr_prev, width)
+    assert width >= 0.02 - 1e-9
+
+
+@pytest.mark.parametrize("k", [2, 3])
+def test_zone_width_from_atr_scale_invariant_via_fixture_01(k):
+    h1 = load_h1("01_buy_valid")
+    m15 = load_m15("01_buy_valid")
+    r_base = evaluate_sweep_candidate(h1, m15, compute_atr(h1, period=14), sweep_idx=22, zone_width_atr=0.10)
+
+    h1_scaled, m15_scaled = _scale_h1_m15(h1, m15, k)
+    atr_scaled = compute_atr(h1_scaled, period=14)
+    r_scaled = evaluate_sweep_candidate(h1_scaled, m15_scaled, atr_scaled, sweep_idx=22, zone_width_atr=0.10)
+
+    assert r_scaled.status == r_base.status
+    assert r_scaled.stage == r_base.stage
+    assert r_scaled.zone_width_used == pytest.approx(r_base.zone_width_used * k)
